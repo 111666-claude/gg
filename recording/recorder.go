@@ -106,6 +106,19 @@ func (r *Recorder) FinishRecording() *Recording {
 	}
 }
 
+// EnableResourceDedup enables or disables content-based deduplication in the
+// recorder's resource pool. Scenes that reuse the same paths, brushes,
+// images, or fonts many times (typical UI rendering) then store each unique
+// resource once. See ResourcePool.EnableDedup for semantics.
+func (r *Recorder) EnableResourceDedup(enabled bool) {
+	r.resources.EnableDedup(enabled)
+}
+
+// ResourceDedupStats returns the resource pool's deduplication statistics.
+func (r *Recorder) ResourceDedupStats() DedupStats {
+	return r.resources.DedupStats()
+}
+
 // Recording is an immutable container for recorded drawing commands.
 // It can be replayed to any Backend implementation.
 type Recording struct {

@@ -157,6 +157,22 @@
 //   - Efficient resource deduplication via pooling
 //   - Fast playback with direct command dispatch
 //
+// # Resource Deduplication
+//
+// Scenes that reuse the same paths, brushes, images, or fonts (typical UI
+// rendering) can enable content-based deduplication in the resource pool:
+//
+//	rec := recording.NewRecorder(800, 600)
+//	rec.EnableResourceDedup(true)
+//
+// Each unique resource is then stored once: Add calls fingerprint the
+// content (paths by verb/coordinate stream, brushes by full style
+// definition, images by bounds/color model/pixels, fonts by source and
+// configuration) and return the existing reference on a confirmed match.
+// Deduplication is off by default; when off, every Add appends and
+// references follow insertion order. While enabled, the pool is safe for
+// concurrent use. See ResourcePool.EnableDedup and DedupStats.
+//
 // For real-time rendering, prefer direct gg.Context usage. Use recording
 // when you need vector export or command inspection.
 package recording
