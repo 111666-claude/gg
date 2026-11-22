@@ -1,0 +1,141 @@
+=== COMMANDS (78) ===
+0:SetFillStyle recording.SetFillStyleCommand{Brush:0x0}
+1:SetStrokeStyle recording.SetStrokeStyleCommand{Brush:0x0}
+2:SetLineWidth recording.SetLineWidthCommand{Width:2.5}
+3:SetLineCap recording.SetLineCapCommand{Cap:0x1}
+4:SetLineJoin recording.SetLineJoinCommand{Join:0x2}
+5:SetMiterLimit recording.SetMiterLimitCommand{Limit:7}
+6:SetDash recording.SetDashCommand{Pattern:[]float64{12, 6, 3, 6}, Offset:0}
+7:SetDash recording.SetDashCommand{Pattern:[]float64{12, 6, 3, 6}, Offset:4}
+8:SetFillRule recording.SetFillRuleCommand{Rule:0x1}
+9:SetAntiAlias recording.SetAntiAliasCommand{Enabled:false}
+10:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0, C:0, D:0, E:1, F:0}}
+11:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:0, MinY:0, MaxX:1024, MaxY:768}, Brush:0x1}
+12:Save recording.SaveCommand{}
+13:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0, C:40, D:0, E:1, F:40}}
+14:SetFillStyle recording.SetFillStyleCommand{Brush:0x2}
+15:SetStrokeStyle recording.SetStrokeStyleCommand{Brush:0x3}
+16:SetLineWidth recording.SetLineWidthCommand{Width:4}
+17:SetFillStyle recording.SetFillStyleCommand{Brush:0x4}
+18:FillPath recording.FillPathCommand{Path:0x0, Brush:0x5, Rule:0x1}
+19:StrokePath recording.StrokePathCommand{Path:0x1, Brush:0x6, Stroke:recording.Stroke{Width:4, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{12, 6, 3, 6}, DashOffset:4}}
+20:Save recording.SaveCommand{}
+21:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0, C:190, D:0, E:1, F:130}}
+22:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:0.8660254037844386, B:-0.5, C:190, D:0.5, E:0.8660254037844386, F:130}}
+23:SetDash recording.SetDashCommand{Pattern:[]float64{2, 8}, Offset:4}
+24:SetMiterLimit recording.SetMiterLimitCommand{Limit:-3}
+25:SetLineWidth recording.SetLineWidthCommand{Width:NaN}
+26:StrokePath recording.StrokePathCommand{Path:0x2, Brush:0x7, Stroke:recording.Stroke{Width:NaN, Cap:0x1, Join:0x2, MiterLimit:-3, DashPattern:[]float64{2, 8}, DashOffset:4}}
+27:SetLineWidth recording.SetLineWidthCommand{Width:1}
+28:StrokePath recording.StrokePathCommand{Path:0x3, Brush:0x8, Stroke:recording.Stroke{Width:1, Cap:0x1, Join:0x2, MiterLimit:-3, DashPattern:[]float64{2, 8}, DashOffset:4}}
+29:Save recording.SaveCommand{}
+30:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1.299038105676658, B:-0.75, C:190, D:0.75, E:1.299038105676658, F:130}}
+31:SetFillStyle recording.SetFillStyleCommand{Brush:0x9}
+32:DrawText recording.DrawTextCommand{Text:"RPM 8400", X:148.02885682970026, Y:112.69615242270663, FontSize:15, FontFamily:"HUD", Face:text.Face(nil), Brush:0xa}
+33:DrawText recording.DrawTextCommand{Text:"CENTER", X:190, Y:130, FontSize:15, FontFamily:"HUD", Face:text.Face(nil), Brush:0xb}
+34:Restore recording.RestoreCommand{}
+35:DrawText recording.DrawTextCommand{Text:"level2", X:160, Y:181.96152422706632, FontSize:13.999999999999998, FontFamily:"HUD", Face:text.Face(nil), Brush:0xc}
+36:Restore recording.RestoreCommand{}
+37:StrokePath recording.StrokePathCommand{Path:0x4, Brush:0xd, Stroke:recording.Stroke{Width:4, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{12, 6, 3, 6}, DashOffset:4}}
+38:Restore recording.RestoreCommand{}
+39:FillPath recording.FillPathCommand{Path:0x5, Brush:0xe, Rule:0x1}
+40:Save recording.SaveCommand{}
+41:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0, C:500, D:0, E:1, F:500}}
+42:SetClip recording.SetClipCommand{Path:0x6, Rule:0x1}
+43:ClipRoundRect recording.ClipRoundRectCommand{X:-60, Y:-60, W:120, H:120, Radius:10}
+44:SetFillStyle recording.SetFillStyleCommand{Brush:0xf}
+45:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:400, MinY:400, MaxX:430, MaxY:600}, Brush:0x10}
+46:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:440, MinY:400, MaxX:470, MaxY:600}, Brush:0x11}
+47:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:480, MinY:400, MaxX:510, MaxY:600}, Brush:0x12}
+48:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:520, MinY:400, MaxX:550, MaxY:600}, Brush:0x13}
+49:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:560, MinY:400, MaxX:590, MaxY:600}, Brush:0x14}
+50:ClearClip recording.ClearClipCommand{}
+51:Restore recording.RestoreCommand{}
+52:DrawImage recording.DrawImageCommand{Image:0x0, SrcRect:recording.Rect{MinX:0, MinY:0, MaxX:16, MaxY:16}, DstRect:recording.Rect{MinX:10, MinY:10, MaxX:26, MaxY:26}, Options:recording.ImageOptions{Interpolation:0x1, Alpha:1}}
+53:DrawImage recording.DrawImageCommand{Image:0x1, SrcRect:recording.Rect{MinX:0, MinY:0, MaxX:16, MaxY:16}, DstRect:recording.Rect{MinX:192, MinY:192, MaxX:208, MaxY:208}, Options:recording.ImageOptions{Interpolation:0x1, Alpha:1}}
+54:DrawImage recording.DrawImageCommand{Image:0x2, SrcRect:recording.Rect{MinX:0, MinY:0, MaxX:16, MaxY:16}, DstRect:recording.Rect{MinX:300, MinY:300, MaxX:364, MaxY:364}, Options:recording.ImageOptions{Interpolation:0x1, Alpha:1}}
+55:Save recording.SaveCommand{}
+56:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:2, B:0, C:0, D:0, E:2, F:0}}
+57:SetStrokeStyle recording.SetStrokeStyleCommand{Brush:0x15}
+58:StrokeText recording.StrokeTextCommand{Text:"OUTLINE", X:100, Y:1400, FontSize:28, FontFamily:"HUD", Face:text.Face(nil), Brush:0x16, Stroke:recording.Stroke{Width:2.5, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{12, 6, 3, 6}, DashOffset:4}}
+59:StrokeText recording.StrokeTextCommand{Text:"ANCH", X:200, Y:1400, FontSize:28, FontFamily:"HUD", Face:text.Face(nil), Brush:0x17, Stroke:recording.Stroke{Width:2.5, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{12, 6, 3, 6}, DashOffset:4}}
+60:Restore recording.RestoreCommand{}
+61:Save recording.SaveCommand{}
+62:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0.2, C:0, D:0.1, E:1, F:0}}
+63:Save recording.SaveCommand{}
+64:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0, C:0, D:0, E:1, F:0}}
+65:StrokePath recording.StrokePathCommand{Path:0x7, Brush:0x18, Stroke:recording.Stroke{Width:2.5495097567963927, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{12.237646832622683, 6.118823416311342, 3.059411708155671, 6.118823416311342}, DashOffset:4.079215610874228}}
+66:Restore recording.RestoreCommand{}
+67:FillRect recording.FillRectCommand{Rect:recording.Rect{MinX:740, MinY:270, MaxX:878, MaxY:372}, Brush:0x19}
+68:Save recording.SaveCommand{}
+69:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:1, B:0.2, C:780, D:0.1, E:1, F:470}}
+70:SetTransform recording.SetTransformCommand{Matrix:recording.Matrix{A:60, B:6, C:780, D:6, E:30, F:470}}
+71:Restore recording.RestoreCommand{}
+72:StrokePath recording.StrokePathCommand{Path:0x8, Brush:0x1a, Stroke:recording.Stroke{Width:2.5, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{12, 6, 3, 6}, DashOffset:4}}
+73:Restore recording.RestoreCommand{}
+74:SetLineWidth recording.SetLineWidthCommand{Width:+Inf}
+75:SetDash recording.SetDashCommand{Pattern:[]float64{1, -2, 0, 3}, Offset:4}
+76:StrokePath recording.StrokePathCommand{Path:0x9, Brush:0x1b, Stroke:recording.Stroke{Width:+Inf, Cap:0x1, Join:0x2, MiterLimit:7, DashPattern:[]float64{1, -2, 0, 3}, DashOffset:4}}
+77:SetDash recording.SetDashCommand{Pattern:[]float64(nil), Offset:0}
+
+=== PLAYBACK ===
+Begin(1024,768)
+SetTransform(1,0,0,0,1,0)
+FillRect(0,0,1024,768,brush=Solid(0.05,0.05,0.08,1))
+Save()
+SetTransform(1,0,40,0,1,40)
+FillPath(verbs=10,brush=Linear(stops=2),rule=1)
+StrokePath(verbs=10,brush=Solid(0.9,0.9,1,1),w=4,cap=1,join=2,miter=7,dash=[12 6 3 6],off=4)
+Save()
+SetTransform(1,0,190,0,1,130)
+SetTransform(0.8660254037844386,-0.5,190,0.5,0.8660254037844386,130)
+StrokePath(verbs=6,brush=Solid(0.9,0.9,1,1),w=NaN,cap=1,join=2,miter=-3,dash=[2 8],off=4)
+StrokePath(verbs=2,brush=Solid(0.9,0.9,1,1),w=1,cap=1,join=2,miter=-3,dash=[2 8],off=4)
+Save()
+SetTransform(1.299038105676658,-0.75,190,0.75,1.299038105676658,130)
+DrawText("RPM 8400",148.02885682970026,112.69615242270663,faceNil=true,brush=Solid(1,1,0,1))
+DrawText("CENTER",190,130,faceNil=true,brush=Solid(1,1,0,1))
+Restore()
+DrawText("level2",160,181.96152422706632,faceNil=true,brush=Linear(stops=2))
+Restore()
+StrokePath(verbs=5,brush=Solid(0.9,0.9,1,1),w=4,cap=1,join=2,miter=7,dash=[12 6 3 6],off=4)
+Restore()
+FillPath(verbs=6,brush=Solid(0.1,0.2,0.3,1),rule=1)
+Save()
+SetTransform(1,0,500,0,1,500)
+SetTransform(1,0,0,0,1,0)
+SetClip(verbs=6,rule=1)
+SetTransform(1,0,500,0,1,500)
+SetTransform(1,0,0,0,1,0)
+SetClip(verbs=10,rule=0)
+SetTransform(1,0,500,0,1,500)
+FillRect(400,400,430,600,brush=Solid(0,1,0,0.5))
+FillRect(440,400,470,600,brush=Solid(0,1,0,0.5))
+FillRect(480,400,510,600,brush=Solid(0,1,0,0.5))
+FillRect(520,400,550,600,brush=Solid(0,1,0,0.5))
+FillRect(560,400,590,600,brush=Solid(0,1,0,0.5))
+ClearClip()
+Restore()
+DrawImage(img=(0,0)-(16,16),src=0,0,16,16,dst=10,10,26,26)
+DrawImage(img=(0,0)-(16,16),src=0,0,16,16,dst=192,192,208,208)
+DrawImage(img=(0,0)-(16,16),src=0,0,16,16,dst=300,300,364,364)
+Save()
+SetTransform(2,0,0,0,2,0)
+DrawText("OUTLINE",100,1400,faceNil=true,brush=Solid(1,0,1,1))
+DrawText("ANCH",200,1400,faceNil=true,brush=Solid(1,0,1,1))
+Restore()
+Save()
+SetTransform(1,0.2,0,0.1,1,0)
+Save()
+SetTransform(1,0,0,0,1,0)
+StrokePath(verbs=5,brush=Solid(0.1,0.2,0.3,1),w=2.5495097567963927,cap=1,join=2,miter=7,dash=[12.237646832622683 6.118823416311342 3.059411708155671 6.118823416311342],off=4.079215610874228)
+Restore()
+FillRect(740,270,878,372,brush=Solid(0.1,0.2,0.3,1))
+Save()
+SetTransform(1,0.2,780,0.1,1,470)
+SetTransform(60,6,780,6,30,470)
+Restore()
+StrokePath(verbs=3,brush=Solid(0.1,0.2,0.3,1),w=2.5,cap=1,join=2,miter=7,dash=[12 6 3 6],off=4)
+Restore()
+StrokePath(verbs=2,brush=Solid(0.1,0.2,0.3,1),w=+Inf,cap=1,join=2,miter=7,dash=[1 -2 0 3],off=4)
+End()

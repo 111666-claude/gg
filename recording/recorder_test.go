@@ -68,22 +68,22 @@ func TestRecorderSaveRestore(t *testing.T) {
 	rec.SetLineCap(LineCapSquare)
 
 	// Verify modified state
-	if rec.lineWidth != 10 {
-		t.Errorf("lineWidth = %f, want 10", rec.lineWidth)
+	if rec.state.lineWidth != 10 {
+		t.Errorf("lineWidth = %f, want 10", rec.state.lineWidth)
 	}
-	if rec.lineCap != LineCapSquare {
-		t.Errorf("lineCap = %v, want LineCapSquare", rec.lineCap)
+	if rec.state.lineCap != LineCapSquare {
+		t.Errorf("lineCap = %v, want LineCapSquare", rec.state.lineCap)
 	}
 
 	// Restore state
 	rec.Restore()
 
 	// Verify restored state
-	if rec.lineWidth != 5 {
-		t.Errorf("after restore, lineWidth = %f, want 5", rec.lineWidth)
+	if rec.state.lineWidth != 5 {
+		t.Errorf("after restore, lineWidth = %f, want 5", rec.state.lineWidth)
 	}
-	if rec.lineCap != LineCapRound {
-		t.Errorf("after restore, lineCap = %v, want LineCapRound", rec.lineCap)
+	if rec.state.lineCap != LineCapRound {
+		t.Errorf("after restore, lineCap = %v, want LineCapRound", rec.state.lineCap)
 	}
 
 	// Verify commands
@@ -108,8 +108,8 @@ func TestRecorderPushPop(t *testing.T) {
 	rec.SetLineWidth(6)
 	rec.Pop()
 
-	if rec.lineWidth != 3 {
-		t.Errorf("after Pop, lineWidth = %f, want 3", rec.lineWidth)
+	if rec.state.lineWidth != 3 {
+		t.Errorf("after Pop, lineWidth = %f, want 3", rec.state.lineWidth)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestRecorderTransform(t *testing.T) {
 
 	// Test Identity
 	rec.Identity()
-	if !rec.transform.IsIdentity() {
+	if !rec.state.transform.IsIdentity() {
 		t.Error("Identity should set identity matrix")
 	}
 
@@ -158,7 +158,7 @@ func TestRecorderSetColor(t *testing.T) {
 	rec := NewRecorder(100, 100)
 
 	rec.SetRGB(1, 0, 0)
-	brush, ok := rec.fillBrush.(SolidBrush)
+	brush, ok := rec.state.fillBrush.(SolidBrush)
 	if !ok {
 		t.Fatal("fillBrush should be SolidBrush")
 	}
@@ -167,13 +167,13 @@ func TestRecorderSetColor(t *testing.T) {
 	}
 
 	rec.SetRGBA(0, 1, 0, 0.5)
-	brush = rec.fillBrush.(SolidBrush)
+	brush = rec.state.fillBrush.(SolidBrush)
 	if brush.Color.G != 1 || brush.Color.A != 0.5 {
 		t.Errorf("SetRGBA(0,1,0,0.5) resulted in %v", brush.Color)
 	}
 
 	rec.SetHexColor("#0000FF")
-	brush = rec.fillBrush.(SolidBrush)
+	brush = rec.state.fillBrush.(SolidBrush)
 	if brush.Color.B != 1 {
 		t.Errorf("SetHexColor('#0000FF') resulted in B=%f, want 1", brush.Color.B)
 	}
@@ -185,20 +185,20 @@ func TestRecorderSetFillStrokeStyle(t *testing.T) {
 	// Test SetFillStyle
 	fillBrush := NewSolidBrush(gg.Red)
 	rec.SetFillStyle(fillBrush)
-	if rec.fillBrush.(SolidBrush).Color != gg.Red {
+	if rec.state.fillBrush.(SolidBrush).Color != gg.Red {
 		t.Error("SetFillStyle did not set fill brush correctly")
 	}
 
 	// Test SetStrokeStyle
 	strokeBrush := NewSolidBrush(gg.Blue)
 	rec.SetStrokeStyle(strokeBrush)
-	if rec.strokeBrush.(SolidBrush).Color != gg.Blue {
+	if rec.state.strokeBrush.(SolidBrush).Color != gg.Blue {
 		t.Error("SetStrokeStyle did not set stroke brush correctly")
 	}
 
 	// Test SetFillBrush (from gg.Brush)
 	rec.SetFillBrush(gg.Solid(gg.Green))
-	if rec.fillBrush.(SolidBrush).Color != gg.Green {
+	if rec.state.fillBrush.(SolidBrush).Color != gg.Green {
 		t.Error("SetFillBrush did not set fill brush correctly")
 	}
 }
@@ -207,37 +207,37 @@ func TestRecorderLineProperties(t *testing.T) {
 	rec := NewRecorder(100, 100)
 
 	rec.SetLineWidth(5)
-	if rec.lineWidth != 5 {
-		t.Errorf("lineWidth = %f, want 5", rec.lineWidth)
+	if rec.state.lineWidth != 5 {
+		t.Errorf("lineWidth = %f, want 5", rec.state.lineWidth)
 	}
 
 	rec.SetLineCap(LineCapRound)
-	if rec.lineCap != LineCapRound {
-		t.Errorf("lineCap = %v, want LineCapRound", rec.lineCap)
+	if rec.state.lineCap != LineCapRound {
+		t.Errorf("lineCap = %v, want LineCapRound", rec.state.lineCap)
 	}
 
 	rec.SetLineJoin(LineJoinBevel)
-	if rec.lineJoin != LineJoinBevel {
-		t.Errorf("lineJoin = %v, want LineJoinBevel", rec.lineJoin)
+	if rec.state.lineJoin != LineJoinBevel {
+		t.Errorf("lineJoin = %v, want LineJoinBevel", rec.state.lineJoin)
 	}
 
 	rec.SetMiterLimit(8)
-	if rec.miterLimit != 8 {
-		t.Errorf("miterLimit = %f, want 8", rec.miterLimit)
+	if rec.state.miterLimit != 8 {
+		t.Errorf("miterLimit = %f, want 8", rec.state.miterLimit)
 	}
 
 	rec.SetDash(5, 3, 2)
-	if len(rec.dashPattern) != 3 {
-		t.Errorf("dashPattern length = %d, want 3", len(rec.dashPattern))
+	if len(rec.state.dashPattern) != 3 {
+		t.Errorf("dashPattern length = %d, want 3", len(rec.state.dashPattern))
 	}
 
 	rec.SetDashOffset(2)
-	if rec.dashOffset != 2 {
-		t.Errorf("dashOffset = %f, want 2", rec.dashOffset)
+	if rec.state.dashOffset != 2 {
+		t.Errorf("dashOffset = %f, want 2", rec.state.dashOffset)
 	}
 
 	rec.ClearDash()
-	if rec.dashPattern != nil {
+	if rec.state.dashPattern != nil {
 		t.Error("ClearDash should set dashPattern to nil")
 	}
 }
@@ -246,13 +246,13 @@ func TestRecorderFillRule(t *testing.T) {
 	rec := NewRecorder(100, 100)
 
 	rec.SetFillRule(FillRuleEvenOdd)
-	if rec.fillRule != FillRuleEvenOdd {
-		t.Errorf("fillRule = %v, want FillRuleEvenOdd", rec.fillRule)
+	if rec.state.fillRule != FillRuleEvenOdd {
+		t.Errorf("fillRule = %v, want FillRuleEvenOdd", rec.state.fillRule)
 	}
 
 	rec.SetFillRuleGG(gg.FillRuleNonZero)
-	if rec.fillRule != FillRuleNonZero {
-		t.Errorf("fillRule = %v, want FillRuleNonZero", rec.fillRule)
+	if rec.state.fillRule != FillRuleNonZero {
+		t.Errorf("fillRule = %v, want FillRuleNonZero", rec.state.fillRule)
 	}
 }
 
@@ -802,18 +802,18 @@ func TestRecorderNestedSaveRestore(t *testing.T) {
 	rec.Save()
 	rec.SetLineWidth(3)
 
-	if rec.lineWidth != 3 {
-		t.Errorf("nested level 2, lineWidth = %f, want 3", rec.lineWidth)
+	if rec.state.lineWidth != 3 {
+		t.Errorf("nested level 2, lineWidth = %f, want 3", rec.state.lineWidth)
 	}
 
 	rec.Restore()
-	if rec.lineWidth != 2 {
-		t.Errorf("after first restore, lineWidth = %f, want 2", rec.lineWidth)
+	if rec.state.lineWidth != 2 {
+		t.Errorf("after first restore, lineWidth = %f, want 2", rec.state.lineWidth)
 	}
 
 	rec.Restore()
-	if rec.lineWidth != 1 {
-		t.Errorf("after second restore, lineWidth = %f, want 1", rec.lineWidth)
+	if rec.state.lineWidth != 1 {
+		t.Errorf("after second restore, lineWidth = %f, want 1", rec.state.lineWidth)
 	}
 }
 
@@ -825,8 +825,8 @@ func TestRecorderRestoreEmptyStack(t *testing.T) {
 	rec.Pop()
 
 	// State should be unchanged
-	if rec.lineWidth != 1 {
-		t.Errorf("lineWidth = %f after Restore on empty stack, want 1", rec.lineWidth)
+	if rec.state.lineWidth != 1 {
+		t.Errorf("lineWidth = %f after Restore on empty stack, want 1", rec.state.lineWidth)
 	}
 }
 

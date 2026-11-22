@@ -22,7 +22,8 @@ import (
 //	rec.Fill()
 //	recording := rec.FinishRecording()
 //
-// The Recorder is not safe for concurrent use.
+// The Recorder is not safe for concurrent use. Use one Recorder per
+// goroutine; independent Recorders share no mutable state.
 type Recorder struct {
 	width, height int
 	commands      []Command
@@ -31,68 +32,42 @@ type Recorder struct {
 	// Current path being built
 	currentPath *gg.Path
 
-	// Current state
-	fillBrush   Brush
-	strokeBrush Brush
-	lineWidth   float64
-	lineCap     LineCap
-	lineJoin    LineJoin
-	miterLimit  float64
-	dashPattern []float64
-	dashOffset  float64
-	fillRule    FillRule
-	antiAlias   bool
-	transform   Matrix
+	// state is the single live graphics-state snapshot. Every style,
+	// transform and font access goes through it; Save/Restore only push
+	// and pop independent copies on stateStack.
+	state graphicsState
 
-	// Current font
-	fontFace   text.Face
-	fontFamily string
-	fontSize   float64
-
-	// State stack
-	stateStack []recorderState
-}
-
-// recorderState stores the graphics state for Save/Restore.
-type recorderState struct {
-	fillBrush   Brush
-	strokeBrush Brush
-	lineWidth   float64
-	lineCap     LineCap
-	lineJoin    LineJoin
-	miterLimit  float64
-	dashPattern []float64
-	dashOffset  float64
-	fillRule    FillRule
-	antiAlias   bool
-	transform   Matrix
-	fontFace    text.Face
-	fontFamily  string
-	fontSize    float64
+	// stateStack holds cloned snapshots for Save/Restore.
+	stateStack []graphicsState
 }
 
 // NewRecorder creates a new Recorder for the given dimensions.
 // The Recorder starts with default state: black fill/stroke, 1px line width,
 // butt caps, miter joins, non-zero fill rule, and identity transform.
 func NewRecorder(width, height int) *Recorder {
-	defaultBrush := NewSolidBrush(gg.Black)
 	return &Recorder{
 		width:       width,
 		height:      height,
 		commands:    make([]Command, 0, 256),
 		resources:   NewResourcePool(),
 		currentPath: gg.NewPath(),
-		fillBrush:   defaultBrush,
-		strokeBrush: defaultBrush,
-		lineWidth:   1.0,
-		lineCap:     LineCapButt,
-		lineJoin:    LineJoinMiter,
-		miterLimit:  4.0,
-		fillRule:    FillRuleNonZero,
-		antiAlias:   true,
-		transform:   Identity(),
-		stateStack:  make([]recorderState, 0, 8),
+		state:       defaultGraphicsState(),
+		stateStack:  make([]graphicsState, 0, 8),
 	}
+}
+
+// Reset returns the Recorder to the same state as a freshly allocated
+// NewRecorder(width, height): all commands, resources, path contents, styles
+// and saved snapshots are cleared, so a Recorder can be reused for a new
+// recording without leaking state from the previous one. Recordings already
+// returned by FinishRecording keep their own command slice and resource pool
+// and are unaffected.
+func (r *Recorder) Reset() {
+	r.commands = make([]Command, 0, cap(r.commands))
+	r.resources = NewResourcePool()
+	r.currentPath = gg.NewPath()
+	r.state = defaultGraphicsState()
+	r.stateStack = make([]graphicsState, 0, cap(r.stateStack))
 }
 
 // FinishRecording returns an immutable Recording containing all recorded commands.
@@ -286,61 +261,47 @@ func (r *Recorder) Height() int {
 // --------------------------------------------------------------------------
 
 // Save saves the current graphics state to the stack.
-// The state includes transform, fill style, stroke style, and line properties.
+// The state includes transform, fill style, stroke style, line properties,
+// anti-aliasing and font settings.
+//
+// The snapshot is deep-copied, so later mutations (including replacing the
+// dash pattern) cannot affect a saved frame. If the stack has reached
+// maxStateDepth, Save is a no-op: no frame is pushed and no SaveCommand is
+// emitted, preventing unbounded memory growth from runaway nesting.
 func (r *Recorder) Save() {
-	// Clone dash pattern
-	var dashCopy []float64
-	if r.dashPattern != nil {
-		dashCopy = make([]float64, len(r.dashPattern))
-		copy(dashCopy, r.dashPattern)
+	if len(r.stateStack) >= maxStateDepth {
+		return
 	}
-
-	r.stateStack = append(r.stateStack, recorderState{
-		fillBrush:   r.fillBrush,
-		strokeBrush: r.strokeBrush,
-		lineWidth:   r.lineWidth,
-		lineCap:     r.lineCap,
-		lineJoin:    r.lineJoin,
-		miterLimit:  r.miterLimit,
-		dashPattern: dashCopy,
-		dashOffset:  r.dashOffset,
-		fillRule:    r.fillRule,
-		antiAlias:   r.antiAlias,
-		transform:   r.transform,
-		fontFace:    r.fontFace,
-		fontFamily:  r.fontFamily,
-		fontSize:    r.fontSize,
-	})
-
+	r.stateStack = append(r.stateStack, r.state.clone())
 	r.commands = append(r.commands, SaveCommand{})
 }
 
 // Restore restores the previously saved graphics state.
-// If the state stack is empty, this is a no-op.
+// If the state stack is empty, this is a no-op (and emits no command).
+// The restored snapshot is itself a deep copy, so a subsequent SetDash on the
+// live state can never mutate frames still held by the stack.
 func (r *Recorder) Restore() {
-	if len(r.stateStack) == 0 {
+	s, ok := r.popSnapshot()
+	if !ok {
 		return
 	}
-
-	state := r.stateStack[len(r.stateStack)-1]
-	r.stateStack = r.stateStack[:len(r.stateStack)-1]
-
-	r.fillBrush = state.fillBrush
-	r.strokeBrush = state.strokeBrush
-	r.lineWidth = state.lineWidth
-	r.lineCap = state.lineCap
-	r.lineJoin = state.lineJoin
-	r.miterLimit = state.miterLimit
-	r.dashPattern = state.dashPattern
-	r.dashOffset = state.dashOffset
-	r.fillRule = state.fillRule
-	r.antiAlias = state.antiAlias
-	r.transform = state.transform
-	r.fontFace = state.fontFace
-	r.fontFamily = state.fontFamily
-	r.fontSize = state.fontSize
-
+	r.state = s
 	r.commands = append(r.commands, RestoreCommand{})
+}
+
+// popSnapshot removes and returns the top state frame without emitting a
+// command. It is the single stack-pop primitive: Restore and DrawEllipticalArc
+// both unwind frames through it so stack semantics live in exactly one place.
+// The returned snapshot already owns an independent dash slice.
+func (r *Recorder) popSnapshot() (graphicsState, bool) {
+	if len(r.stateStack) == 0 {
+		return graphicsState{}, false
+	}
+	last := len(r.stateStack) - 1
+	s := r.stateStack[last]
+	r.stateStack[last] = graphicsState{} // drop references before shortening
+	r.stateStack = r.stateStack[:last]
+	return s, true
 }
 
 // Push is an alias for Save, matching gg.Context API.
@@ -359,26 +320,26 @@ func (r *Recorder) Pop() {
 
 // Identity resets the transformation matrix to identity.
 func (r *Recorder) Identity() {
-	r.transform = Identity()
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = Identity()
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // Translate applies a translation to the transformation matrix.
 func (r *Recorder) Translate(x, y float64) {
-	r.transform = r.transform.Multiply(Translate(x, y))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = r.state.transform.Multiply(Translate(x, y))
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // Scale applies a scaling transformation.
 func (r *Recorder) Scale(sx, sy float64) {
-	r.transform = r.transform.Multiply(Scale(sx, sy))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = r.state.transform.Multiply(Scale(sx, sy))
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // Rotate applies a rotation (angle in radians).
 func (r *Recorder) Rotate(angle float64) {
-	r.transform = r.transform.Multiply(Rotate(angle))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = r.state.transform.Multiply(Rotate(angle))
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // RotateAbout rotates around a specific point.
@@ -404,30 +365,30 @@ func (r *Recorder) ShearAbout(sx, sy, x, y float64) {
 
 // Shear applies a shear transformation.
 func (r *Recorder) Shear(x, y float64) {
-	r.transform = r.transform.Multiply(Shear(x, y))
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = r.state.transform.Multiply(Shear(x, y))
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // Transform multiplies the current transformation matrix by the given matrix.
 func (r *Recorder) Transform(m Matrix) {
-	r.transform = r.transform.Multiply(m)
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = r.state.transform.Multiply(m)
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // SetTransform replaces the current transformation matrix.
 func (r *Recorder) SetTransform(m Matrix) {
-	r.transform = m
-	r.commands = append(r.commands, SetTransformCommand{Matrix: r.transform})
+	r.state.transform = m
+	r.commands = append(r.commands, SetTransformCommand{Matrix: r.state.transform})
 }
 
 // GetTransform returns a copy of the current transformation matrix.
 func (r *Recorder) GetTransform() Matrix {
-	return r.transform
+	return r.state.transform
 }
 
 // TransformPoint transforms a point by the current matrix.
 func (r *Recorder) TransformPoint(x, y float64) (float64, float64) {
-	return r.transform.TransformPoint(x, y)
+	return r.state.transform.TransformPoint(x, y)
 }
 
 // InvertY inverts the Y axis (useful for coordinate system changes).
@@ -443,8 +404,8 @@ func (r *Recorder) InvertY() {
 // SetColor sets both fill and stroke color from a color.Color.
 func (r *Recorder) SetColor(c gg.RGBA) {
 	brush := NewSolidBrush(c)
-	r.fillBrush = brush
-	r.strokeBrush = brush
+	r.state.fillBrush = brush
+	r.state.strokeBrush = brush
 	brushRef := r.resources.AddBrush(brush)
 	r.commands = append(r.commands,
 		SetFillStyleCommand{Brush: brushRef},
@@ -468,14 +429,14 @@ func (r *Recorder) SetHexColor(hex string) {
 
 // SetFillStyle sets the fill brush.
 func (r *Recorder) SetFillStyle(brush Brush) {
-	r.fillBrush = brush
+	r.state.fillBrush = brush
 	brushRef := r.resources.AddBrush(brush)
 	r.commands = append(r.commands, SetFillStyleCommand{Brush: brushRef})
 }
 
 // SetStrokeStyle sets the stroke brush.
 func (r *Recorder) SetStrokeStyle(brush Brush) {
-	r.strokeBrush = brush
+	r.state.strokeBrush = brush
 	brushRef := r.resources.AddBrush(brush)
 	r.commands = append(r.commands, SetStrokeStyleCommand{Brush: brushRef})
 }
@@ -516,13 +477,13 @@ func (r *Recorder) SetStrokeRGBA(red, green, blue, alpha float64) {
 
 // SetLineWidth sets the line width for stroking.
 func (r *Recorder) SetLineWidth(width float64) {
-	r.lineWidth = width
+	r.state.lineWidth = width
 	r.commands = append(r.commands, SetLineWidthCommand{Width: width})
 }
 
 // SetLineCap sets the line cap style.
 func (r *Recorder) SetLineCap(lc LineCap) {
-	r.lineCap = lc
+	r.state.lineCap = lc
 	r.commands = append(r.commands, SetLineCapCommand{Cap: lc})
 }
 
@@ -534,7 +495,7 @@ func (r *Recorder) SetLineCapGG(lc gg.LineCap) {
 
 // SetLineJoin sets the line join style.
 func (r *Recorder) SetLineJoin(join LineJoin) {
-	r.lineJoin = join
+	r.state.lineJoin = join
 	r.commands = append(r.commands, SetLineJoinCommand{Join: join})
 }
 
@@ -546,7 +507,7 @@ func (r *Recorder) SetLineJoinGG(join gg.LineJoin) {
 
 // SetMiterLimit sets the miter limit for line joins.
 func (r *Recorder) SetMiterLimit(limit float64) {
-	r.miterLimit = limit
+	r.state.miterLimit = limit
 	r.commands = append(r.commands, SetMiterLimitCommand{Limit: limit})
 }
 
@@ -559,29 +520,29 @@ func (r *Recorder) SetDash(lengths ...float64) {
 		return
 	}
 
-	r.dashPattern = make([]float64, len(lengths))
-	copy(r.dashPattern, lengths)
-	r.commands = append(r.commands, SetDashCommand{Pattern: r.dashPattern, Offset: r.dashOffset})
+	r.state.dashPattern = make([]float64, len(lengths))
+	copy(r.state.dashPattern, lengths)
+	r.commands = append(r.commands, SetDashCommand{Pattern: r.state.dashPattern, Offset: r.state.dashOffset})
 }
 
 // SetDashOffset sets the starting offset into the dash pattern.
 func (r *Recorder) SetDashOffset(offset float64) {
-	r.dashOffset = offset
-	if r.dashPattern != nil {
-		r.commands = append(r.commands, SetDashCommand{Pattern: r.dashPattern, Offset: r.dashOffset})
+	r.state.dashOffset = offset
+	if r.state.dashPattern != nil {
+		r.commands = append(r.commands, SetDashCommand{Pattern: r.state.dashPattern, Offset: r.state.dashOffset})
 	}
 }
 
 // ClearDash removes the dash pattern, returning to solid lines.
 func (r *Recorder) ClearDash() {
-	r.dashPattern = nil
-	r.dashOffset = 0
+	r.state.dashPattern = nil
+	r.state.dashOffset = 0
 	r.commands = append(r.commands, SetDashCommand{Pattern: nil, Offset: 0})
 }
 
 // SetFillRule sets the fill rule.
 func (r *Recorder) SetFillRule(rule FillRule) {
-	r.fillRule = rule
+	r.state.fillRule = rule
 	r.commands = append(r.commands, SetFillRuleCommand{Rule: rule})
 }
 
@@ -594,13 +555,13 @@ func (r *Recorder) SetFillRuleGG(rule gg.FillRule) {
 // SetAntiAlias enables or disables anti-aliasing for geometry rendering.
 // When disabled, shapes are rendered with binary coverage (no gray edge pixels).
 func (r *Recorder) SetAntiAlias(enabled bool) {
-	r.antiAlias = enabled
+	r.state.antiAlias = enabled
 	r.commands = append(r.commands, SetAntiAliasCommand{Enabled: enabled})
 }
 
 // AntiAlias returns whether anti-aliasing is enabled.
 func (r *Recorder) AntiAlias() bool {
-	return r.antiAlias
+	return r.state.antiAlias
 }
 
 // --------------------------------------------------------------------------
@@ -609,28 +570,28 @@ func (r *Recorder) AntiAlias() bool {
 
 // MoveTo starts a new subpath at the given point.
 func (r *Recorder) MoveTo(x, y float64) {
-	px, py := r.transform.TransformPoint(x, y)
+	px, py := r.state.transform.TransformPoint(x, y)
 	r.currentPath.MoveTo(px, py)
 }
 
 // LineTo adds a line to the current path.
 func (r *Recorder) LineTo(x, y float64) {
-	px, py := r.transform.TransformPoint(x, y)
+	px, py := r.state.transform.TransformPoint(x, y)
 	r.currentPath.LineTo(px, py)
 }
 
 // QuadraticTo adds a quadratic Bezier curve to the current path.
 func (r *Recorder) QuadraticTo(cx, cy, x, y float64) {
-	cpx, cpy := r.transform.TransformPoint(cx, cy)
-	px, py := r.transform.TransformPoint(x, y)
+	cpx, cpy := r.state.transform.TransformPoint(cx, cy)
+	px, py := r.state.transform.TransformPoint(x, y)
 	r.currentPath.QuadraticTo(cpx, cpy, px, py)
 }
 
 // CubicTo adds a cubic Bezier curve to the current path.
 func (r *Recorder) CubicTo(c1x, c1y, c2x, c2y, x, y float64) {
-	cp1x, cp1y := r.transform.TransformPoint(c1x, c1y)
-	cp2x, cp2y := r.transform.TransformPoint(c2x, c2y)
-	px, py := r.transform.TransformPoint(x, y)
+	cp1x, cp1y := r.state.transform.TransformPoint(c1x, c1y)
+	cp2x, cp2y := r.state.transform.TransformPoint(c2x, c2y)
+	px, py := r.state.transform.TransformPoint(x, y)
 	r.currentPath.CubicTo(cp1x, cp1y, cp2x, cp2y, px, py)
 }
 
@@ -661,12 +622,12 @@ func (r *Recorder) Fill() {
 	}
 
 	pathRef := r.resources.AddPath(r.currentPath)
-	brushRef := r.resources.AddBrush(r.fillBrush)
+	brushRef := r.resources.AddBrush(r.state.fillBrush)
 
 	r.commands = append(r.commands, FillPathCommand{
 		Path:  pathRef,
 		Brush: brushRef,
-		Rule:  r.fillRule,
+		Rule:  r.state.fillRule,
 	})
 
 	r.currentPath = gg.NewPath()
@@ -679,12 +640,12 @@ func (r *Recorder) FillPreserve() {
 	}
 
 	pathRef := r.resources.AddPath(r.currentPath)
-	brushRef := r.resources.AddBrush(r.fillBrush)
+	brushRef := r.resources.AddBrush(r.state.fillBrush)
 
 	r.commands = append(r.commands, FillPathCommand{
 		Path:  pathRef,
 		Brush: brushRef,
-		Rule:  r.fillRule,
+		Rule:  r.state.fillRule,
 	})
 }
 
@@ -695,21 +656,12 @@ func (r *Recorder) Stroke() {
 	}
 
 	pathRef := r.resources.AddPath(r.currentPath)
-	brushRef := r.resources.AddBrush(r.strokeBrush)
-
-	stroke := Stroke{
-		Width:       r.lineWidth,
-		Cap:         r.lineCap,
-		Join:        r.lineJoin,
-		MiterLimit:  r.miterLimit,
-		DashPattern: r.dashPattern,
-		DashOffset:  r.dashOffset,
-	}
+	brushRef := r.resources.AddBrush(r.state.strokeBrush)
 
 	r.commands = append(r.commands, StrokePathCommand{
 		Path:   pathRef,
 		Brush:  brushRef,
-		Stroke: stroke,
+		Stroke: r.state.currentStroke(),
 	})
 
 	r.currentPath = gg.NewPath()
@@ -722,21 +674,12 @@ func (r *Recorder) StrokePreserve() {
 	}
 
 	pathRef := r.resources.AddPath(r.currentPath)
-	brushRef := r.resources.AddBrush(r.strokeBrush)
-
-	stroke := Stroke{
-		Width:       r.lineWidth,
-		Cap:         r.lineCap,
-		Join:        r.lineJoin,
-		MiterLimit:  r.miterLimit,
-		DashPattern: r.dashPattern,
-		DashOffset:  r.dashOffset,
-	}
+	brushRef := r.resources.AddBrush(r.state.strokeBrush)
 
 	r.commands = append(r.commands, StrokePathCommand{
 		Path:   pathRef,
 		Brush:  brushRef,
-		Stroke: stroke,
+		Stroke: r.state.currentStroke(),
 	})
 }
 
@@ -869,20 +812,13 @@ func (r *Recorder) DrawEllipticalArc(x, y, rx, ry, angle1, angle2 float64) {
 	r.Translate(x, y)
 	r.Scale(rx, ry)
 	r.DrawArc(0, 0, 1, angle1, angle2)
-	// Restore state but keep path changes
-	if len(r.stateStack) > 0 {
-		state := r.stateStack[len(r.stateStack)-1]
-		r.stateStack = r.stateStack[:len(r.stateStack)-1]
-		r.fillBrush = state.fillBrush
-		r.strokeBrush = state.strokeBrush
-		r.lineWidth = state.lineWidth
-		r.lineCap = state.lineCap
-		r.lineJoin = state.lineJoin
-		r.miterLimit = state.miterLimit
-		r.dashPattern = state.dashPattern
-		r.dashOffset = state.dashOffset
-		r.fillRule = state.fillRule
-		r.transform = state.transform
+	// Unwind the frame through the shared stack primitive so the full
+	// snapshot (styles, font, anti-alias, transform) is restored, while
+	// keeping the path contents that were built under the local transform.
+	// A RestoreCommand is always emitted, matching the pre-refactor stream
+	// even when Save was a no-op against a full or empty stack.
+	if s, ok := r.popSnapshot(); ok {
+		r.state = s
 	}
 	r.commands = append(r.commands, RestoreCommand{})
 }
@@ -895,11 +831,11 @@ func (r *Recorder) DrawEllipticalArc(x, y, rx, ry, angle1, angle2 float64) {
 // This is an optimized operation for the common case of axis-aligned rectangles.
 func (r *Recorder) FillRectangle(x, y, w, h float64) {
 	// Transform corners
-	x1, y1 := r.transform.TransformPoint(x, y)
-	x2, y2 := r.transform.TransformPoint(x+w, y+h)
+	x1, y1 := r.state.transform.TransformPoint(x, y)
+	x2, y2 := r.state.transform.TransformPoint(x+w, y+h)
 
 	rect := NewRectFromPoints(x1, y1, x2, y2)
-	brushRef := r.resources.AddBrush(r.fillBrush)
+	brushRef := r.resources.AddBrush(r.state.fillBrush)
 
 	r.commands = append(r.commands, FillRectCommand{
 		Rect:  rect,
@@ -909,20 +845,13 @@ func (r *Recorder) FillRectangle(x, y, w, h float64) {
 
 // StrokeRectangle strokes a rectangle without adding it to the path.
 func (r *Recorder) StrokeRectangle(x, y, w, h float64) {
-	stroke := Stroke{
-		Width:       r.lineWidth,
-		Cap:         r.lineCap,
-		Join:        r.lineJoin,
-		MiterLimit:  r.miterLimit,
-		DashPattern: r.dashPattern,
-		DashOffset:  r.dashOffset,
-	}
+	stroke := r.state.currentStroke()
 	// Recorder paths contain world-space coordinates, while gg applies the
 	// current transform's scale to stroke metrics at draw time. Playback uses
 	// identity for those world-space paths, so capture the same metric scaling
 	// in the command. Dash lengths follow gg's current convention and scale
 	// only when the transform enlarges the path.
-	transformScale := r.transform.ScaleFactor()
+	transformScale := r.state.transform.ScaleFactor()
 	if transformScale <= 0 {
 		transformScale = 1
 	}
@@ -934,24 +863,24 @@ func (r *Recorder) StrokeRectangle(x, y, w, h float64) {
 		}
 		stroke.DashOffset *= transformScale
 	}
-	brushRef := r.resources.AddBrush(r.strokeBrush)
+	brushRef := r.resources.AddBrush(r.state.strokeBrush)
 
 	// StrokeRectCommand stores only normalized world-space bounds, so it is
 	// exact only when translation is the complete transform and the input
 	// dimensions preserve the path's top-left start and clockwise traversal.
 	// Other transforms need all four transformed corners, especially for
 	// dashed strokes where traversal direction is observable.
-	translationOnly := r.transform.A == 1 && r.transform.B == 0 &&
-		r.transform.D == 0 && r.transform.E == 1
+	translationOnly := r.state.transform.A == 1 && r.state.transform.B == 0 &&
+		r.state.transform.D == 0 && r.state.transform.E == 1
 	if w < 0 || h < 0 || !translationOnly {
 		path := gg.NewPath()
-		x1, y1 := r.transform.TransformPoint(x, y)
+		x1, y1 := r.state.transform.TransformPoint(x, y)
 		path.MoveTo(x1, y1)
-		x2, y2 := r.transform.TransformPoint(x+w, y)
+		x2, y2 := r.state.transform.TransformPoint(x+w, y)
 		path.LineTo(x2, y2)
-		x3, y3 := r.transform.TransformPoint(x+w, y+h)
+		x3, y3 := r.state.transform.TransformPoint(x+w, y+h)
 		path.LineTo(x3, y3)
-		x4, y4 := r.transform.TransformPoint(x, y+h)
+		x4, y4 := r.state.transform.TransformPoint(x, y+h)
 		path.LineTo(x4, y4)
 		path.Close()
 		pathRef := r.resources.AddPath(path)
@@ -969,8 +898,8 @@ func (r *Recorder) StrokeRectangle(x, y, w, h float64) {
 
 	// Keep the compact representation for the common axis-aligned,
 	// traversal-preserving case.
-	x1, y1 := r.transform.TransformPoint(x, y)
-	x2, y2 := r.transform.TransformPoint(x+w, y+h)
+	x1, y1 := r.state.transform.TransformPoint(x, y)
+	x2, y2 := r.state.transform.TransformPoint(x+w, y+h)
 	rect := NewRectFromPoints(x1, y1, x2, y2)
 
 	r.commands = append(r.commands, StrokeRectCommand{
@@ -993,7 +922,7 @@ func (r *Recorder) Clip() {
 	pathRef := r.resources.AddPath(r.currentPath)
 	r.commands = append(r.commands, SetClipCommand{
 		Path: pathRef,
-		Rule: r.fillRule,
+		Rule: r.state.fillRule,
 	})
 
 	r.currentPath = gg.NewPath()
@@ -1008,7 +937,7 @@ func (r *Recorder) ClipPreserve() {
 	pathRef := r.resources.AddPath(r.currentPath)
 	r.commands = append(r.commands, SetClipCommand{
 		Path: pathRef,
-		Rule: r.fillRule,
+		Rule: r.state.fillRule,
 	})
 }
 
@@ -1042,8 +971,8 @@ func (r *Recorder) DrawImage(img image.Image, x, y int) {
 	imageRef := r.resources.AddImage(img)
 
 	// Transform destination rectangle
-	x1, y1 := r.transform.TransformPoint(float64(x), float64(y))
-	x2, y2 := r.transform.TransformPoint(float64(x+w), float64(y+h))
+	x1, y1 := r.state.transform.TransformPoint(float64(x), float64(y))
+	x2, y2 := r.state.transform.TransformPoint(float64(x+w), float64(y+h))
 
 	srcRect := NewRect(0, 0, float64(w), float64(h))
 	dstRect := NewRectFromPoints(x1, y1, x2, y2)
@@ -1073,8 +1002,8 @@ func (r *Recorder) DrawImageAnchored(img image.Image, x, y int, ax, ay float64) 
 	imageRef := r.resources.AddImage(img)
 
 	// Transform destination rectangle
-	x1, y1 := r.transform.TransformPoint(drawX, drawY)
-	x2, y2 := r.transform.TransformPoint(drawX+float64(w), drawY+float64(h))
+	x1, y1 := r.state.transform.TransformPoint(drawX, drawY)
+	x2, y2 := r.state.transform.TransformPoint(drawX+float64(w), drawY+float64(h))
 
 	srcRect := NewRect(0, 0, float64(w), float64(h))
 	dstRect := NewRectFromPoints(x1, y1, x2, y2)
@@ -1100,8 +1029,8 @@ func (r *Recorder) DrawImageScaled(img image.Image, x, y, w, h float64) {
 	imageRef := r.resources.AddImage(img)
 
 	// Transform destination rectangle
-	x1, y1 := r.transform.TransformPoint(x, y)
-	x2, y2 := r.transform.TransformPoint(x+w, y+h)
+	x1, y1 := r.state.transform.TransformPoint(x, y)
+	x2, y2 := r.state.transform.TransformPoint(x+w, y+h)
 
 	srcRect := NewRect(0, 0, float64(srcW), float64(srcH))
 	dstRect := NewRectFromPoints(x1, y1, x2, y2)
@@ -1120,23 +1049,23 @@ func (r *Recorder) DrawImageScaled(img image.Image, x, y, w, h float64) {
 
 // SetFont sets the current font face for text drawing.
 func (r *Recorder) SetFont(face text.Face) {
-	r.fontFace = face
+	r.state.fontFace = face
 }
 
 // SetFontSize sets the current font size in points.
 func (r *Recorder) SetFontSize(size float64) {
-	r.fontSize = size
+	r.state.fontSize = size
 }
 
 // SetFontFamily sets the current font family name.
 func (r *Recorder) SetFontFamily(family string) {
-	r.fontFamily = family
+	r.state.fontFamily = family
 }
 
 // transformScale returns the uniform scale factor from the current CTM.
 // Used to scale font size into world space (matching pre-transformed positions).
 func (r *Recorder) transformScale() float64 {
-	return math.Sqrt(r.transform.A*r.transform.A + r.transform.B*r.transform.B)
+	return math.Sqrt(r.state.transform.A*r.state.transform.A + r.state.transform.B*r.state.transform.B)
 }
 
 // DrawString draws text at position (x, y) where y is the baseline.
@@ -1144,16 +1073,16 @@ func (r *Recorder) transformScale() float64 {
 // scale factor so that playback in identity space renders at the correct size
 // (matching how positions are pre-transformed).
 func (r *Recorder) DrawString(s string, x, y float64) {
-	px, py := r.transform.TransformPoint(x, y)
-	brushRef := r.resources.AddBrush(r.fillBrush)
+	px, py := r.state.transform.TransformPoint(x, y)
+	brushRef := r.resources.AddBrush(r.state.fillBrush)
 
 	r.commands = append(r.commands, DrawTextCommand{
 		Text:       s,
 		X:          px,
 		Y:          py,
-		FontSize:   r.fontSize * r.transformScale(),
-		FontFamily: r.fontFamily,
-		Face:       r.fontFace,
+		FontSize:   r.state.fontSize * r.transformScale(),
+		FontFamily: r.state.fontFamily,
+		Face:       r.state.fontFace,
 		Brush:      brushRef,
 	})
 }
@@ -1163,9 +1092,9 @@ func (r *Recorder) DrawString(s string, x, y float64) {
 // matching Context.DrawStringAnchored exactly. The final baseline position is
 // stored in the command (Skia SkTextBlob pattern — pre-positioned glyphs).
 func (r *Recorder) DrawStringAnchored(s string, x, y, ax, ay float64) {
-	if r.fontFace != nil && (ax != 0 || ay != 0) {
-		w, _ := text.Measure(s, r.fontFace)
-		metrics := r.fontFace.Metrics()
+	if r.state.fontFace != nil && (ax != 0 || ay != 0) {
+		w, _ := text.Measure(s, r.state.fontFace)
+		metrics := r.state.fontFace.Metrics()
 		h := metrics.Ascent + metrics.Descent
 		x -= w * ax
 		y = y + metrics.Ascent - ay*h
@@ -1176,37 +1105,28 @@ func (r *Recorder) DrawStringAnchored(s string, x, y, ax, ay float64) {
 // StrokeString strokes text outlines at position (x, y) where y is the baseline.
 // The stroke width, cap, join, and dash are captured from the current recorder state.
 func (r *Recorder) StrokeString(s string, x, y float64) {
-	px, py := r.transform.TransformPoint(x, y)
+	px, py := r.state.transform.TransformPoint(x, y)
 
-	brushRef := r.resources.AddBrush(r.strokeBrush)
-
-	stroke := Stroke{
-		Width:       r.lineWidth,
-		Cap:         r.lineCap,
-		Join:        r.lineJoin,
-		MiterLimit:  r.miterLimit,
-		DashPattern: r.dashPattern,
-		DashOffset:  r.dashOffset,
-	}
+	brushRef := r.resources.AddBrush(r.state.strokeBrush)
 
 	r.commands = append(r.commands, StrokeTextCommand{
 		Text:       s,
 		X:          px,
 		Y:          py,
-		FontSize:   r.fontSize * r.transformScale(),
-		FontFamily: r.fontFamily,
-		Face:       r.fontFace,
+		FontSize:   r.state.fontSize * r.transformScale(),
+		FontFamily: r.state.fontFamily,
+		Face:       r.state.fontFace,
 		Brush:      brushRef,
-		Stroke:     stroke,
+		Stroke:     r.state.currentStroke(),
 	})
 }
 
 // StrokeStringAnchored strokes text outlines with an anchor point.
 // Anchor offset computed at record time, same as DrawStringAnchored.
 func (r *Recorder) StrokeStringAnchored(s string, x, y, ax, ay float64) {
-	if r.fontFace != nil && (ax != 0 || ay != 0) {
-		w, _ := text.Measure(s, r.fontFace)
-		metrics := r.fontFace.Metrics()
+	if r.state.fontFace != nil && (ax != 0 || ay != 0) {
+		w, _ := text.Measure(s, r.state.fontFace)
+		metrics := r.state.fontFace.Metrics()
 		h := metrics.Ascent + metrics.Descent
 		x -= w * ax
 		y = y + metrics.Ascent - ay*h
@@ -1218,24 +1138,24 @@ func (r *Recorder) StrokeStringAnchored(s string, x, y, ax, ay float64) {
 // Note: Actual measurement depends on the backend and font.
 // Returns (0, 0) if no font is set.
 func (r *Recorder) MeasureString(s string) (w, h float64) {
-	if r.fontFace == nil {
+	if r.state.fontFace == nil {
 		// Approximate measurement based on font size
 		// Average character width is roughly 0.6 * font size
-		w = float64(len(s)) * r.fontSize * 0.6
-		h = r.fontSize * 1.2
+		w = float64(len(s)) * r.state.fontSize * 0.6
+		h = r.state.fontSize * 1.2
 		return
 	}
-	return text.Measure(s, r.fontFace)
+	return text.Measure(s, r.state.fontFace)
 }
 
 // WordWrap wraps text to fit within the given width using word boundaries.
 // Uses the current font face for text measurement.
 // If no font face is set, returns the input string as a single-element slice.
 func (r *Recorder) WordWrap(s string, w float64) []string {
-	if r.fontFace == nil {
+	if r.state.fontFace == nil {
 		return []string{s}
 	}
-	results := text.WrapText(s, r.fontFace, w, text.WrapWord)
+	results := text.WrapText(s, r.state.fontFace, w, text.WrapWord)
 	lines := make([]string, len(results))
 	for i, res := range results {
 		lines[i] = res.Text
@@ -1247,13 +1167,13 @@ func (r *Recorder) WordWrap(s string, w float64) []string {
 // Returns (width, height) where width is the maximum line width.
 // If no font face is set, returns (0, 0).
 func (r *Recorder) MeasureMultilineString(s string, lineSpacing float64) (width, height float64) {
-	if r.fontFace == nil {
+	if r.state.fontFace == nil {
 		return 0, 0
 	}
 	lines := recorderSplitLines(s)
-	fh := r.fontFace.Metrics().LineHeight()
+	fh := r.state.fontFace.Metrics().LineHeight()
 	for _, line := range lines {
-		lw, _ := text.Measure(line, r.fontFace)
+		lw, _ := text.Measure(line, r.state.fontFace)
 		if lw > width {
 			width = lw
 		}
@@ -1272,10 +1192,10 @@ func (r *Recorder) DrawStringWrapped(s string, x, y, ax, ay, width, lineSpacing 
 	}
 
 	var fh float64
-	if r.fontFace != nil {
-		fh = r.fontFace.Metrics().LineHeight()
+	if r.state.fontFace != nil {
+		fh = r.state.fontFace.Metrics().LineHeight()
 	} else {
-		fh = r.fontSize * 1.2
+		fh = r.state.fontSize * 1.2
 	}
 
 	// Total height (same formula as MeasureMultilineString)
@@ -1330,10 +1250,10 @@ func (r *Recorder) Clear() {
 // ClearWithColor fills the entire canvas with the specified color.
 // This is the recommended way to set a background color before drawing.
 func (r *Recorder) ClearWithColor(c gg.RGBA) {
-	oldBrush := r.fillBrush
-	r.fillBrush = NewSolidBrush(c)
+	oldBrush := r.state.fillBrush
+	r.state.fillBrush = NewSolidBrush(c)
 	r.FillRectangle(0, 0, float64(r.width), float64(r.height))
-	r.fillBrush = oldBrush
+	r.state.fillBrush = oldBrush
 }
 
 // GetCurrentPoint returns the current point of the path.
