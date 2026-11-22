@@ -106,6 +106,29 @@ func (r *Recorder) FinishRecording() *Recording {
 	}
 }
 
+// NewRecording builds a Recording from externally produced commands and a
+// resource pool. It is the entry point for plugins that generate recordings
+// without driving a Recorder: the result can be validated with
+// ValidateRecording before being handed to any playback Backend, turning
+// bad references into structured validation errors instead of backend-side
+// nil dereferences.
+//
+// The command slice and pool are stored directly (not copied); callers should
+// treat them as immutable after construction, matching the contract of
+// recordings produced by FinishRecording. A nil pool is replaced with an
+// empty one so a command-less recording remains playable.
+func NewRecording(width, height int, commands []Command, resources *ResourcePool) *Recording {
+	if resources == nil {
+		resources = NewResourcePool()
+	}
+	return &Recording{
+		width:     width,
+		height:    height,
+		commands:  commands,
+		resources: resources,
+	}
+}
+
 // Recording is an immutable container for recorded drawing commands.
 // It can be replayed to any Backend implementation.
 type Recording struct {

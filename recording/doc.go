@@ -84,6 +84,34 @@
 // This ensures recordings are immutable and can be safely played back
 // multiple times to different backends.
 //
+// # Validation
+//
+// Recordings produced by an external plugin should be inspected with
+// ValidateRecording before playback. A bad reference otherwise stays latent
+// and only becomes a nil dereference (or arithmetic fault) inside a concrete
+// Backend. Validation is read-only — it never mutates the recording — and
+// checks:
+//
+//   - command order, including balanced Save/Restore nesting
+//   - ClipRoundRect parameters (finite, positive size, in-range radius)
+//   - Path/Brush/Image/Font references (in-range, non-nil, valid tags)
+//
+//   - finiteness of every numeric parameter (no NaN/Inf) and enum ranges
+//
+// By default all defects are collected as ValidationErrors; FailFast stops at
+// the first one, and MaxValidationErrors bounds work on adversarial input:
+//
+//	if err := recording.ValidateRecording(r, recording.FailFast()); err != nil {
+//	    var ve recording.ValidationError
+//	    if errors.As(err, &ve) {
+//	        log.Printf("bad command %d: %s", ve.CommandIndex, ve.Reason)
+//	    }
+//	    return
+//	}
+//	_ = r.Playback(backend)
+//
+// An empty, well-formed recording always validates successfully.
+//
 // # Supported Operations
 //
 // The Recorder supports the full gg drawing API:
