@@ -84,6 +84,21 @@
 // This ensures recordings are immutable and can be safely played back
 // multiple times to different backends.
 //
+// # Binary Persistence
+//
+// A Recording can be serialized to a versioned binary format and read back
+// later — in another process or after an editor restart — with canvas size,
+// command order, paths, brushes, images, fonts, and transforms intact:
+//
+//	data, _ := r.MarshalBinary()       // or r.WriteTo(w)
+//	r2, err := recording.Decode(bytes.NewReader(data))
+//
+// The encoding is deterministic (the same Recording always produces the same
+// bytes) and a decode→encode round trip reproduces the input byte-for-byte.
+// Fonts with available source data are embedded so decoded text renders
+// identically; see Decode and WithFontResolver for details. Corrupt input is
+// reported as *DecodeError with byte offset and command index, never a panic.
+//
 // # Supported Operations
 //
 // The Recorder supports the full gg drawing API:

@@ -148,6 +148,17 @@ func (s *FontSource) Parsed() ParsedFont {
 	return s.parsed
 }
 
+// Data returns the raw font file bytes (TTF/OTF/TTC) this source was created
+// from. The slice is shared with the FontSource and must not be modified.
+// Returns nil after Close. Serialization code (e.g. recording persistence)
+// uses this to embed the exact font so a decoded face renders identically.
+func (s *FontSource) Data() []byte {
+	s.copyCheck()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data
+}
+
 // Close releases resources associated with the FontSource.
 // All faces created from this source become invalid after Close.
 func (s *FontSource) Close() error {
