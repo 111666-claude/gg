@@ -108,16 +108,18 @@ func (fc *FilterChain) Apply(src, dst *gg.Pixmap, bounds Rect) {
 		return
 	}
 
-	// Multiple filters - need temporary buffer
-	// Calculate maximum expanded bounds
+	// Multiple filters - need temporary buffer.
+	// Calculate maximum expanded bounds.
 	maxBounds := bounds
 	for _, f := range fc.filters {
 		maxBounds = f.ExpandBounds(maxBounds)
 	}
 
-	// Create temporary buffer
-	w := int(maxBounds.Width()) + 1
-	h := int(maxBounds.Height()) + 1
+	// Size the temps from the full rectangle. Using Width()/Height() alone
+	// loses the Min offset (e.g. negative-origin expanded bounds), which
+	// would undersize the buffer; cover the integer pixel span explicitly.
+	w := int(maxBounds.MaxX) - int(maxBounds.MinX) + 1
+	h := int(maxBounds.MaxY) - int(maxBounds.MinY) + 1
 	if w < 1 {
 		w = 1
 	}
