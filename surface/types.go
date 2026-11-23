@@ -190,6 +190,10 @@ type DrawImageOptions struct {
 	DstRect *image.Rectangle
 
 	// Alpha is the opacity (0.0 = transparent, 1.0 = opaque).
+	// The zero value means "unset" and is treated as 1.0 (fully opaque),
+	// so a bare DrawImageOptions with only SrcRect set draws at full opacity.
+	// Explicit negative or NaN values are no-ops; values above 1 and +Inf
+	// are clamped to 1.
 	// Default: 1.0
 	Alpha float64
 

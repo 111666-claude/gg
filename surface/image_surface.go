@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 
 	"github.com/gogpu/gg/internal/raster"
 )
@@ -176,43 +177,95 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 }
 
 // DrawImage draws an image at the specified position.
+//
+// Every source pixel is normalized to premultiplied-alpha 8-bit RGBA before
+// compositing, regardless of the concrete image type (image.RGBA, image.NRGBA,
+// any color.Color implementation) or a non-zero source origin. Opacity is
+// applied in premultiplied space so fully transparent pixels never leak RGB
+// (no black fringing on transparent edges).
+//
+// Sanitization semantics:
+//   - NaN opacity, negative opacity, or any non-finite negative value is
+//     treated as 0 (no-op).
+//   - +Inf and values above 1 are clamped to 1.
+//   - nil/empty images, empty source rectangles and non-finite positions are
+//     no-ops; existing pixels are left untouched.
+//   - Drawing on a closed surface is a no-op.
+//
+// Compositing is Porter-Duff source-over, so repeated draws and partial
+// overlaps never introduce dark seams.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
-	if s.closed || img == nil {
+	opacity, srcBounds, dstX, dstY, ok := s.prepareDrawImage(img, at, opts)
+	if !ok {
 		return
 	}
 
-	srcBounds := img.Bounds()
+	for sy := srcBounds.Min.Y; sy < srcBounds.Max.Y; sy++ {
+		dy64 := int64(dstY) + int64(sy-srcBounds.Min.Y)
+		if dy64 < 0 || dy64 >= int64(s.height) {
+			continue
+		}
+		s.blitImageRow(img, sy, srcBounds, dstX, int(dy64), opacity)
+	}
+}
+
+// prepareDrawImage validates and sanitizes DrawImage inputs. The returned
+// ok is false when the call must be a no-op (closed surface, nil/empty
+// source, zero/NaN/negative opacity, or non-finite position).
+func (s *ImageSurface) prepareDrawImage(
+	img image.Image, at Point, opts *DrawImageOptions,
+) (opacity float64, srcBounds image.Rectangle, dstX, dstY int, ok bool) {
+	if s.closed || img == nil || s.img == nil {
+		return 0, image.Rectangle{}, 0, 0, false
+	}
+
+	opacity = clampDrawOpacity(opacityOf(opts))
+	if opacity == 0 {
+		return 0, image.Rectangle{}, 0, 0, false
+	}
+
+	if math.IsNaN(at.X) || math.IsInf(at.X, 0) ||
+		math.IsNaN(at.Y) || math.IsInf(at.Y, 0) {
+		return 0, image.Rectangle{}, 0, 0, false
+	}
+
+	srcBounds = img.Bounds()
 	if opts != nil && opts.SrcRect != nil {
 		srcBounds = *opts.SrcRect
 	}
-
-	dstX := int(at.X)
-	dstY := int(at.Y)
-
-	alpha := 1.0
-	if opts != nil {
-		alpha = opts.Alpha
+	// Only pixels that actually exist in the source can be sampled. The
+	// requested origin is preserved for destination mapping.
+	srcBounds = srcBounds.Intersect(img.Bounds())
+	if srcBounds.Empty() {
+		return 0, image.Rectangle{}, 0, 0, false
 	}
 
-	// Simple nearest-neighbor blit for now
-	for sy := srcBounds.Min.Y; sy < srcBounds.Max.Y; sy++ {
-		dy := dstY + (sy - srcBounds.Min.Y)
-		if dy < 0 || dy >= s.height {
+	return opacity, srcBounds, int(at.X), int(at.Y), true
+}
+
+// blitImageRow composites one source scanline (row sy) onto destination row
+// dy, honoring horizontal clipping and the requested opacity.
+func (s *ImageSurface) blitImageRow(
+	img image.Image, sy int, srcBounds image.Rectangle, dstX, dy int, opacity float64,
+) {
+	for sx := srcBounds.Min.X; sx < srcBounds.Max.X; sx++ {
+		dx64 := int64(dstX) + int64(sx-srcBounds.Min.X)
+		if dx64 < 0 || dx64 >= int64(s.width) {
 			continue
 		}
 
-		for sx := srcBounds.Min.X; sx < srcBounds.Max.X; sx++ {
-			dx := dstX + (sx - srcBounds.Min.X)
-			if dx < 0 || dx >= s.width {
+		pr, pg, pb, pa := premulPixelAt(img, sx, sy)
+		if pa == 0 {
+			// Zero-alpha pixels carry no color: never leak RGB.
+			continue
+		}
+		if opacity < 1 {
+			pr, pg, pb, pa = scalePremul(pr, pg, pb, pa, opacity)
+			if pa == 0 {
 				continue
 			}
-
-			srcColor := img.At(sx, sy)
-			if alpha < 1.0 {
-				srcColor = s.applyAlpha(srcColor, alpha)
-			}
-			s.blendPixel(dx, dy, srcColor)
 		}
+		s.overPixel(int(dx64), dy, pr, pg, pb, pa)
 	}
 }
 
@@ -337,31 +390,93 @@ func (s *ImageSurface) blendPixelAlpha(x, y int, src color.RGBA, alpha uint8) {
 	s.img.Pix[idx+3] = uint8(outA)
 }
 
-// blendPixel blends a color onto the image at (x, y).
-func (s *ImageSurface) blendPixel(x, y int, src color.Color) {
-	r, g, b, a := src.RGBA()
-	//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
-	srcR := uint8(r >> 8)
-	//nolint:gosec // G115: safe
-	srcG := uint8(g >> 8)
-	//nolint:gosec // G115: safe
-	srcB := uint8(b >> 8)
-	//nolint:gosec // G115: safe
-	srcA := uint8(a >> 8)
-	s.blendPixelAlpha(x, y, color.RGBA{srcR, srcG, srcB, srcA}, 255)
+// opacityOf extracts the requested DrawImage opacity. A zero-valued Alpha
+// field (the common case of a bare DrawImageOptions with only SrcRect set)
+// means "unset" and defaults to fully opaque; callers wanting a true
+// no-op pass an explicit value after sanitization (negative or NaN Alpha).
+func opacityOf(opts *DrawImageOptions) float64 {
+	if opts == nil || opts.Alpha == 0 {
+		return 1
+	}
+	return opts.Alpha
 }
 
-// applyAlpha multiplies a color's alpha by the given factor.
-func (s *ImageSurface) applyAlpha(c color.Color, alpha float64) color.Color {
-	r, g, b, a := c.RGBA()
-	newA := uint16(float64(a) * alpha)
-	//nolint:gosec // G115: safe - r,g,b are uint32 from RGBA() which fits uint16
-	return color.RGBA64{
-		R: uint16(r),
-		G: uint16(g),
-		B: uint16(b),
-		A: newA,
+// clampDrawOpacity sanitizes an opacity value into the finite range [0, 1].
+// NaN and negative values become 0 (no-op); +Inf and over-1 values clamp to 1.
+func clampDrawOpacity(v float64) float64 {
+	if math.IsNaN(v) || v < 0 {
+		return 0
 	}
+	if v > 1 || math.IsInf(v, 1) {
+		return 1
+	}
+	return v
+}
+
+// premulPixelAt returns the source pixel at (x, y) as 8-bit premultiplied
+// RGBA. Non-premultiplied sources (image.NRGBA, arbitrary color.Color values)
+// are converted, so zero-alpha pixels always return zeroed RGB.
+func premulPixelAt(img image.Image, x, y int) (r, g, b, a uint8) {
+	switch src := img.(type) {
+	case *image.RGBA:
+		i := src.PixOffset(x, y)
+		// image.RGBA stores premultiplied values directly.
+		return src.Pix[i+0], src.Pix[i+1], src.Pix[i+2], src.Pix[i+3]
+	case *image.NRGBA:
+		i := src.PixOffset(x, y)
+		nr, ng, nb, na := src.Pix[i+0], src.Pix[i+1], src.Pix[i+2], src.Pix[i+3]
+		return nrgbaToPremul(nr, ng, nb, na)
+	default:
+		cr, cg, cb, ca := img.At(x, y).RGBA()
+		return uint8(cr >> 8), uint8(cg >> 8), uint8(cb >> 8), uint8(ca >> 8)
+	}
+}
+
+// nrgbaToPremul converts a straight (non-premultiplied) 8-bit RGBA pixel to
+// premultiplied 8-bit RGBA, matching color.NRGBA's model conversion.
+func nrgbaToPremul(nr, ng, nb, na uint8) (r, g, b, a uint8) {
+	if na == 0 {
+		return 0, 0, 0, 0
+	}
+	if na == 255 {
+		return nr, ng, nb, 255
+	}
+	//nolint:gosec // G115: products are bounded by 255*255 + 127.
+	r = uint8((uint16(nr)*uint16(na) + 127) / 255)
+	//nolint:gosec // G115
+	g = uint8((uint16(ng)*uint16(na) + 127) / 255)
+	//nolint:gosec // G115
+	b = uint8((uint16(nb)*uint16(na) + 127) / 255)
+	return r, g, b, na
+}
+
+// scalePremul multiplies a premultiplied pixel by an opacity in (0, 1).
+// Scaling RGB and A together preserves the premultiplied invariant.
+func scalePremul(r, g, b, a uint8, opacity float64) (nr, ng, nb, na uint8) {
+	//nolint:gosec // G115: round-half-up results stay within [0, 255].
+	nr = uint8(float64(r)*opacity + 0.5)
+	//nolint:gosec // G115
+	ng = uint8(float64(g)*opacity + 0.5)
+	//nolint:gosec // G115
+	nb = uint8(float64(b)*opacity + 0.5)
+	//nolint:gosec // G115
+	na = uint8(float64(a)*opacity + 0.5)
+	return nr, ng, nb, na
+}
+
+// overPixel composites one premultiplied source pixel over the surface using
+// Porter-Duff source-over: out = src + dst*(1-srcA).
+func (s *ImageSurface) overPixel(x, y int, sr, sg, sb, sa uint8) {
+	if sa == 0 {
+		return
+	}
+	idx := s.img.PixOffset(x, y)
+	invA := uint32(255 - sa)
+
+	s.img.Pix[idx+0] = uint8(uint32(sr) + uint32(s.img.Pix[idx+0])*invA/255)
+	s.img.Pix[idx+1] = uint8(uint32(sg) + uint32(s.img.Pix[idx+1])*invA/255)
+	s.img.Pix[idx+2] = uint8(uint32(sb) + uint32(s.img.Pix[idx+2])*invA/255)
+	s.img.Pix[idx+3] = uint8(uint32(sa) + uint32(s.img.Pix[idx+3])*invA/255)
 }
 
 // expandStroke creates a filled path representing the stroke outline.

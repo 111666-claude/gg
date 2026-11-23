@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`surface.ImageSurface.DrawImage` normalizes every source to premultiplied alpha before compositing** —
+  transparent NRGBA pixels (and arbitrary `color.Color` sources) no longer leak their straight RGB into the
+  destination, which produced black fringes on transparent edges. `image.RGBA`, `image.NRGBA`, generic
+  `color.Color` images and sources with non-zero bounds origins now share one premultiplied Porter-Duff
+  source-over path, so repeated draws and semi-transparent edges never introduce dark seams. Opacity is
+  sanitized: NaN, negative and `-Inf` values are no-ops, `+Inf` and values above 1 clamp to 1, and the zero
+  value keeps its "unset → fully opaque" meaning. Nil/empty images, empty or disjoint source rectangles,
+  non-finite destination positions and draws on a closed surface are no-ops that preserve existing pixels.
+  Fill/Stroke and the GPU surface are unaffected.
+
 ## [0.52.6] - 2026-11-08
 
 ### Security
