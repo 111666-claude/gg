@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`scene.GaussianBlurFilter` — composable Gaussian blur for retained-scene layers** — the scene package previously
+  exposed only the `Filter`/`FilterChain` interfaces with no reusable blur implementation, so night-UI glow could not
+  be applied to layer content. `NewGaussianBlur(radiusX, radiusY)` (radius is sigma, truncated at 3 sigma),
+  `NewGaussianBlurSigma` and the advanced `NewGaussianBlurTaps` (explicit odd/even kernels) provide independent
+  per-axis, bounded separable kernels over premultiplied-alpha RGBA. Edges sample transparent black rather than
+  extending border pixels, so alpha only spreads and nothing outside the filter region is brightened; `ExpandBounds`
+  grows layer bounds by the kernel reach and composes through `FilterChain`. Radius zero, empty/transparent layers,
+  even kernels and huge radii all have deterministic results (kernel reach and scratch memory are capped). Repeated
+  `Apply` never mutates the source (including in-place use), scratch buffers are pooled with zero steady-state
+  allocations, and `Renderer.ApplyLayerFilter` wires the filter into the CPU renderer, layer cache and expanded dirty
+  bounds. `FilterChain.Apply` now propagates each stage's expanded bounds and uses pooled, destination-sized scratch
+  pixmaps, fixing dropped writes for non-zero bounds origins in multi-filter chains.
+
 ### Fixed
 
 - **Arbitrary-path clips draw their content in gogpu windows** — with a circle, star or any other non-rectangular

@@ -1566,6 +1566,55 @@ func (r *Renderer) MarkDirty(x, y, w, h int) {
 	r.tileGrid.MarkRectDirty(x, y, w, h)
 }
 
+// ApplyLayerFilter runs a Filter over a rendered layer pixmap and writes the
+// result to output, wiring filters into the CPU retained-mode pipeline.
+//
+// layerBounds is the unfiltered content bounds of the layer; the filter's
+// ExpandBounds determines the region actually processed and is also marked
+// dirty, so the blur halo is redrawn even where the layer itself has no
+// content. Negative or partly off-screen expanded bounds are clamped safely
+// by the dirty-region and pixmap code paths.
+//
+// When the renderer's LayerCache holds an entry for layerHash it is used as
+// the source instead of layer, letting static filtered layers skip their
+// rasterization. The filtered result is placed in the cache under resultHash
+// when it fits the cache budget. Either hash may be 0 to bypass caching.
+//
+// src is never modified; filters allocate their own scratch storage.
+func (r *Renderer) ApplyLayerFilter(layer, output *gg.Pixmap, layerHash, resultHash uint64,
+	layerBounds Rect, filter Filter,
+) Rect {
+	if output == nil || filter == nil {
+		return layerBounds
+	}
+
+	src := layer
+	if layerHash != 0 && r.cache != nil {
+		if cached, ok := r.cache.Get(layerHash); ok && cached != nil {
+			src = cached
+		}
+	}
+	if src == nil {
+		return layerBounds
+	}
+
+	expanded := filter.ExpandBounds(layerBounds)
+	filter.Apply(src, output, expanded)
+
+	if resultHash != 0 && r.cache != nil {
+		// Store an independent copy: output remains caller-owned and may be
+		// reused or overwritten next frame, so the cache must not alias it.
+		cached := gg.NewPixmap(output.Width(), output.Height())
+		copy(cached.Data(), output.Data())
+		r.cache.Put(resultHash, cached, 0)
+	}
+
+	// Mark the full expanded region dirty (clamped internally to tile range).
+	ir := expanded.ImageRect()
+	r.MarkDirty(ir.Min.X, ir.Min.Y, ir.Dx(), ir.Dy())
+	return expanded
+}
+
 // MarkAllDirty marks all tiles as needing redraw.
 func (r *Renderer) MarkAllDirty() {
 	if r.dirty != nil {

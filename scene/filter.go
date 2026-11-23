@@ -1,6 +1,49 @@
 package scene
 
-import "github.com/gogpu/gg"
+import (
+	"sync"
+
+	"github.com/gogpu/gg"
+)
+
+// maxChainTempBytes bounds the memory retained by the FilterChain scratch
+// pixmap pool. Pixmaps above this size are freed instead of pooled, so one
+// oversized frame cannot pin large buffers for the process lifetime.
+const maxChainTempBytes = 16 * 1024 * 1024 // 16 MiB of RGBA8 (4 Mi-pixel)
+
+// chainPixmapPool reuses destination-sized scratch pixmaps across chain
+// applications. It stores *gg.Pixmap directly, so after warmup the hot path
+// allocates nothing. A size mismatch frees the pooled pixmap and allocates a
+// fresh one.
+var chainPixmapPool sync.Pool
+
+// acquireChainPixmap returns a cleared pixmap of exactly w*h, from the pool
+// when one of matching size is available. Scratch pixmaps must always start
+// transparent: a fresh allocation is zeroed by Go, and pooled ones are
+// cleared explicitly so no residue from a previous frame survives.
+func acquireChainPixmap(w, h int) *gg.Pixmap {
+	if v := chainPixmapPool.Get(); v != nil {
+		pm := v.(*gg.Pixmap)
+		if pm.Width() == w && pm.Height() == h {
+			pm.Clear(gg.Transparent)
+			return pm
+		}
+	}
+	// gg.NewPixmap is backed by a zeroed byte slice.
+	return gg.NewPixmap(w, h)
+}
+
+// releaseChainPixmap returns a scratch pixmap to the pool unless it exceeds
+// the memory cap, in which case it is left for garbage collection.
+func releaseChainPixmap(pm *gg.Pixmap) {
+	if pm == nil {
+		return
+	}
+	if int64(pm.Width())*int64(pm.Height())*4 > maxChainTempBytes {
+		return
+	}
+	chainPixmapPool.Put(pm)
+}
 
 // Filter applies visual effects to rendered layers.
 // Filters are applied during layer pop when LayerFiltered is used.
@@ -93,7 +136,16 @@ func (fc *FilterChain) Add(f Filter) {
 
 // Apply processes src through all filters in sequence.
 // For chains with more than one filter, temporary buffers are used.
+//
+// Every stage receives the bounds produced by the previous stage's
+// ExpandBounds, so filters that grow their output (e.g. Gaussian blur) keep
+// their full halo through the chain. Temporary pixmaps share the destination's
+// coordinate system and dimensions, so non-zero bounds origins work the same
+// as origin-zero ones; the scratch pixmaps are drawn from a size-capped pool.
 func (fc *FilterChain) Apply(src, dst *gg.Pixmap, bounds Rect) {
+	if src == nil || dst == nil {
+		return
+	}
 	if len(fc.filters) == 0 {
 		// No filters - copy src to dst if different
 		if src != dst {
@@ -108,41 +160,38 @@ func (fc *FilterChain) Apply(src, dst *gg.Pixmap, bounds Rect) {
 		return
 	}
 
-	// Multiple filters - need temporary buffer
-	// Calculate maximum expanded bounds
-	maxBounds := bounds
-	for _, f := range fc.filters {
-		maxBounds = f.ExpandBounds(maxBounds)
+	// Multiple filters - alternate between two destination-sized scratch
+	// pixmaps. Same dimensions and coordinate system as dst means every
+	// stage (including expanded bounds and non-zero origins) is handled by
+	// the filter's own edge clamping.
+	temp1 := acquireChainPixmap(dst.Width(), dst.Height())
+	temp2 := acquireChainPixmap(dst.Width(), dst.Height())
+	defer func() {
+		releaseChainPixmap(temp1)
+		releaseChainPixmap(temp2)
+	}()
+
+	currentBounds := bounds
+	current := src
+
+	for i, f := range fc.filters {
+		// Each stage processes the bounds accumulated by every ExpandBounds
+		// before it, so the first blur's halo is visible to the second.
+		stageBounds := currentBounds
+		currentBounds = f.ExpandBounds(currentBounds)
+
+		if i == len(fc.filters)-1 {
+			f.Apply(current, dst, stageBounds)
+			continue
+		}
+
+		next := temp1
+		if i%2 == 1 {
+			next = temp2
+		}
+		f.Apply(current, next, stageBounds)
+		current = next
 	}
-
-	// Create temporary buffer
-	w := int(maxBounds.Width()) + 1
-	h := int(maxBounds.Height()) + 1
-	if w < 1 {
-		w = 1
-	}
-	if h < 1 {
-		h = 1
-	}
-
-	temp1 := gg.NewPixmap(w, h)
-	temp2 := gg.NewPixmap(w, h)
-
-	// Apply first filter: src -> temp1
-	fc.filters[0].Apply(src, temp1, bounds)
-	currentBounds := fc.filters[0].ExpandBounds(bounds)
-
-	// Apply middle filters: alternate between temp1 and temp2
-	current := temp1
-	next := temp2
-	for i := 1; i < len(fc.filters)-1; i++ {
-		fc.filters[i].Apply(current, next, currentBounds)
-		currentBounds = fc.filters[i].ExpandBounds(currentBounds)
-		current, next = next, current
-	}
-
-	// Apply last filter: current -> dst
-	fc.filters[len(fc.filters)-1].Apply(current, dst, currentBounds)
 }
 
 // ExpandBounds returns the combined expansion of all filters.
