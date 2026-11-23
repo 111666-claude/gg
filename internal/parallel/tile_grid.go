@@ -25,6 +25,12 @@ type TileGrid struct {
 	// height is the canvas height in pixels.
 	height int
 
+	// tileW/tileH are the grid step dimensions in pixels. They equal
+	// TileWidth/TileHeight for standard grids and may differ for grids
+	// created with NewTileGridWithSize.
+	tileW int
+	tileH int
+
 	// pool is used for tile memory allocation.
 	pool *TilePool
 }
@@ -34,6 +40,17 @@ type TileGrid struct {
 // Edge tiles will have reduced dimensions if the canvas is not evenly
 // divisible by the tile size (64x64).
 func NewTileGrid(width, height int) *TileGrid {
+	return NewTileGridWithSize(width, height, TileWidth, TileHeight)
+}
+
+// NewTileGridWithSize creates a tile grid with an explicit tile step size.
+// tileW/tileH must be positive; non-positive values fall back to the standard
+// 64x64 geometry. This is used by determinism tests that exercise multiple
+// tile dimensions; production callers should use NewTileGrid.
+func NewTileGridWithSize(width, height, tileW, tileH int) *TileGrid {
+	if tileW <= 0 || tileH <= 0 {
+		tileW, tileH = TileWidth, TileHeight
+	}
 	if width <= 0 || height <= 0 {
 		return &TileGrid{
 			tiles:  nil,
@@ -41,12 +58,14 @@ func NewTileGrid(width, height int) *TileGrid {
 			tilesY: 0,
 			width:  0,
 			height: 0,
+			tileW:  tileW,
+			tileH:  tileH,
 			pool:   NewTilePool(),
 		}
 	}
 
-	tilesX := (width + TileWidth - 1) / TileWidth
-	tilesY := (height + TileHeight - 1) / TileHeight
+	tilesX := (width + tileW - 1) / tileW
+	tilesY := (height + tileH - 1) / tileH
 
 	g := &TileGrid{
 		tiles:  make([]*Tile, tilesX*tilesY),
@@ -54,6 +73,8 @@ func NewTileGrid(width, height int) *TileGrid {
 		tilesY: tilesY,
 		width:  width,
 		height: height,
+		tileW:  tileW,
+		tileH:  tileH,
 		pool:   NewTilePool(),
 	}
 
@@ -66,22 +87,26 @@ func (g *TileGrid) allocateTiles() {
 	for ty := range g.tilesY {
 		for tx := range g.tilesX {
 			// Calculate actual tile dimensions (edge tiles may be smaller)
-			tileW := TileWidth
-			tileH := TileHeight
+			tileW := g.tileW
+			tileH := g.tileH
 
 			// Right edge tile
-			if (tx+1)*TileWidth > g.width {
-				tileW = g.width - tx*TileWidth
+			if (tx+1)*g.tileW > g.width {
+				tileW = g.width - tx*g.tileW
 			}
 			// Bottom edge tile
-			if (ty+1)*TileHeight > g.height {
-				tileH = g.height - ty*TileHeight
+			if (ty+1)*g.tileH > g.height {
+				tileH = g.height - ty*g.tileH
 			}
 
 			tile := g.pool.Get(tileW, tileH)
 			tile.X = tx
 			tile.Y = ty
 			tile.Dirty = true // New tiles start dirty
+			if g.tileW != TileWidth || g.tileH != TileHeight {
+				tile.stepW = g.tileW
+				tile.stepH = g.tileH
+			}
 
 			g.tiles[ty*g.tilesX+tx] = tile
 		}
@@ -102,8 +127,8 @@ func (g *TileGrid) Resize(width, height int) {
 		return
 	}
 
-	newTilesX := (width + TileWidth - 1) / TileWidth
-	newTilesY := (height + TileHeight - 1) / TileHeight
+	newTilesX := (width + g.tileW - 1) / g.tileW
+	newTilesY := (height + g.tileH - 1) / g.tileH
 
 	// Check if dimensions actually changed
 	if g.width == width && g.height == height {
@@ -139,8 +164,8 @@ func (g *TileGrid) TileAtPixel(px, py int) *Tile {
 	if px < 0 || px >= g.width || py < 0 || py >= g.height {
 		return nil
 	}
-	tx := px / TileWidth
-	ty := py / TileHeight
+	tx := px / g.tileW
+	ty := py / g.tileH
 	return g.tiles[ty*g.tilesX+tx]
 }
 
@@ -163,10 +188,10 @@ func (g *TileGrid) TilesInRect(x, y, w, h int) []*Tile {
 	}
 
 	// Convert to tile coordinates
-	tx1 := x1 / TileWidth
-	ty1 := y1 / TileHeight
-	tx2 := (x2 - 1) / TileWidth
-	ty2 := (y2 - 1) / TileHeight
+	tx1 := x1 / g.tileW
+	ty1 := y1 / g.tileH
+	tx2 := (x2 - 1) / g.tileW
+	ty2 := (y2 - 1) / g.tileH
 
 	// Collect tiles
 	result := make([]*Tile, 0, (tx2-tx1+1)*(ty2-ty1+1))

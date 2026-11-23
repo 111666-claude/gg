@@ -53,6 +53,14 @@ type Tile struct {
 	// Data contains the RGBA pixel data owned by this tile.
 	// Length is Width * Height * 4 bytes.
 	Data []byte
+
+	// stepW/stepH override the grid step used to convert tile indices to
+	// pixel coordinates. Zero means use the package TileWidth/TileHeight
+	// constants (the production 64x64 grid). They are set by grids created
+	// with NewTileGridWithSize so non-standard tile geometries report
+	// correct Bounds without changing the default Tile layout.
+	stepW int
+	stepH int
 }
 
 // Reset clears the tile data for reuse.
@@ -65,7 +73,25 @@ func (t *Tile) Reset() {
 // Bounds returns the pixel bounds of this tile in canvas space.
 // Returns (x, y, width, height) where x,y is the top-left corner.
 func (t *Tile) Bounds() (x, y, w, h int) {
-	return t.X * TileWidth, t.Y * TileHeight, t.Width, t.Height
+	return t.X * t.effectiveStepW(), t.Y * t.effectiveStepH(), t.Width, t.Height
+}
+
+// effectiveStepW returns the horizontal grid step for this tile, falling back
+// to the package default when the tile belongs to a standard 64x64 grid.
+func (t *Tile) effectiveStepW() int {
+	if t.stepW > 0 {
+		return t.stepW
+	}
+	return TileWidth
+}
+
+// effectiveStepH returns the vertical grid step for this tile, falling back
+// to the package default when the tile belongs to a standard 64x64 grid.
+func (t *Tile) effectiveStepH() int {
+	if t.stepH > 0 {
+		return t.stepH
+	}
+	return TileHeight
 }
 
 // PixelOffset returns the byte offset into Data for the given pixel.
@@ -83,8 +109,8 @@ func (t *Tile) PixelOffset(px, py int) int {
 // Returns -1 if the pixel is not within this tile.
 func (t *Tile) CanvasPixelOffset(cx, cy int) int {
 	// Convert canvas coordinates to tile-local coordinates
-	tileX := t.X * TileWidth
-	tileY := t.Y * TileHeight
+	tileX := t.X * t.effectiveStepW()
+	tileY := t.Y * t.effectiveStepH()
 
 	px := cx - tileX
 	py := cy - tileY
@@ -94,8 +120,8 @@ func (t *Tile) CanvasPixelOffset(cx, cy int) int {
 
 // Contains returns true if the canvas-space pixel (cx, cy) is within this tile.
 func (t *Tile) Contains(cx, cy int) bool {
-	tileX := t.X * TileWidth
-	tileY := t.Y * TileHeight
+	tileX := t.X * t.effectiveStepW()
+	tileY := t.Y * t.effectiveStepH()
 
 	return cx >= tileX && cx < tileX+t.Width &&
 		cy >= tileY && cy < tileY+t.Height

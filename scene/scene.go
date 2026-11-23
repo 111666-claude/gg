@@ -1,6 +1,10 @@
 package scene
 
-import "github.com/gogpu/gg/text"
+import (
+	"sync"
+
+	"github.com/gogpu/gg/text"
+)
 
 // Scene is the main retained mode container for accumulating drawing operations.
 // It builds an Encoding that can be efficiently rendered or cached.
@@ -66,6 +70,14 @@ type Scene struct {
 	// pathPool reuses Path objects to avoid per-shape allocations in Fill/Stroke.
 	// Each shape.ToPath() creates a new Path; pooling eliminates this overhead.
 	pathPool PathPool
+
+	// encodingMu guards the lazy layer flattening performed by Encoding() and
+	// Flatten(). A finished scene is commonly rendered concurrently from
+	// multiple renderers/workers; flattening mutates the root encoding and
+	// layer stack, so it must be serialized. Recording (Fill/Stroke/...) is
+	// still intended to happen before concurrent rendering, matching the
+	// retained-mode build-then-render contract.
+	encodingMu sync.Mutex
 }
 
 // NewScene creates a new empty scene.
@@ -471,7 +483,13 @@ func (s *Scene) Rotate(angle float32) {
 
 // Encoding returns the root encoding containing all scene commands.
 // This encoding can be used for rendering or caching.
+//
+// Safe for concurrent invocation: the lazy layer flattening mutates internal
+// state and is serialized with an internal mutex. Callers must not record new
+// commands concurrently with rendering.
 func (s *Scene) Encoding() *Encoding {
+	s.encodingMu.Lock()
+	defer s.encodingMu.Unlock()
 	// Flatten all layers into root encoding
 	s.flattenLayers()
 	return s.encoding
@@ -500,6 +518,8 @@ func (s *Scene) Encoding() *Encoding {
 //	flat := scene.Flatten()
 //	// flat contains both shapes with layer compositing applied
 func (s *Scene) Flatten() *Encoding {
+	s.encodingMu.Lock()
+	defer s.encodingMu.Unlock()
 	// First ensure all layers are flattened
 	s.flattenLayers()
 

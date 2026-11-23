@@ -171,6 +171,36 @@ type Renderer struct {
 	stats     RenderStats
 	statsMu   sync.RWMutex
 	lastFrame time.Time
+
+	// -----------------------------------------------------------------------
+	// Test-only determinism hooks. All default to zero values, which preserve
+	// production behavior exactly. They are exercised by the parallel
+	// determinism quality gate (determinism_test.go) and are not part of the
+	// public API.
+	// -----------------------------------------------------------------------
+
+	// tileOrderHook, when non-nil, reorders the tile slice before raster and
+	// composite scheduling, simulating arbitrary worker scheduling order.
+	tileOrderHook func(tiles []*parallel.Tile) []*parallel.Tile
+
+	// pixmapHook, when non-nil, intercepts per-tile temporary Pixmap
+	// acquisition. Returning a shared pixmap injects a resource race for
+	// gate-negative tests.
+	pixmapHook func(w, h int) *gg.Pixmap
+
+	// testTileW/testTileH override the fixed 64x64 tile geometry. Zero means
+	// use parallel.TileWidth/TileHeight (production default). The grid and
+	// dirty region are built with the override so the whole pipeline runs at
+	// the requested tile size.
+	testTileW int
+	testTileH int
+
+	// tileCmdTracker, when non-nil, records the tag-stream command indices of
+	// draw commands each tile executes. The outer slice is indexed by tile
+	// grid position (ty*tilesX+tx); each entry holds the positions for that
+	// tile and is written by exactly one goroutine, so no per-entry locking
+	// is needed. Populated during RenderWithContext/RenderDirty.
+	tileCmdTracker [][]int
 }
 
 // RenderStats contains performance statistics for a render operation.
@@ -254,13 +284,21 @@ func NewRenderer(width, height int, opts ...RendererOption) *Renderer {
 		opt(r)
 	}
 
+	// Test-only tile geometry override. Zero/negative values keep the
+	// production 64x64 default.
+	tileW, tileH := parallel.TileWidth, parallel.TileHeight
+	if r.testTileW > 0 && r.testTileH > 0 {
+		tileW, tileH = r.testTileW, r.testTileH
+		r.tileSize = tileW
+	}
+
 	// Initialize parallel infrastructure
-	r.tileGrid = parallel.NewTileGrid(width, height)
+	r.tileGrid = parallel.NewTileGridWithSize(width, height, tileW, tileH)
 	r.workerPool = parallel.NewWorkerPool(r.workers)
 
 	// Initialize dirty region tracking
-	tilesX := (width + parallel.TileWidth - 1) / parallel.TileWidth
-	tilesY := (height + parallel.TileHeight - 1) / parallel.TileHeight
+	tilesX := (width + tileW - 1) / tileW
+	tilesY := (height + tileH - 1) / tileH
 	r.dirty = parallel.NewDirtyRegion(tilesX, tilesY)
 	r.dirty.MarkAll() // Initially all tiles are dirty
 
@@ -326,6 +364,9 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	// Mark all tiles dirty for full render
 	r.dirty.MarkAll()
 
+	// Reset per-tile command tracking for this render pass.
+	r.resetTileCmdTracker()
+
 	// Get the flattened encoding, image registry, and font registry.
 	startEncode := time.Now()
 	enc := scene.Encoding()
@@ -341,7 +382,7 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	}
 
 	// Get all tiles for rendering
-	tiles := r.tileGrid.AllTiles()
+	tiles := r.orderTiles(r.tileGrid.AllTiles())
 	tilesTotal := len(tiles)
 
 	// Render tiles in parallel with context
@@ -455,6 +496,9 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	r.stats = RenderStats{}
 	r.statsMu.Unlock()
 
+	// Reset per-tile command tracking for this dirty render pass.
+	r.resetTileCmdTracker()
+
 	// Use provided dirty region or fall back to internal tracking
 	dirtyRegion := dirty
 	if dirtyRegion == nil {
@@ -490,6 +534,7 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 			tiles = append(tiles, tile)
 		}
 	}
+	tiles = r.orderTiles(tiles)
 
 	// Render dirty tiles in parallel with context
 	startRaster := time.Now()
@@ -516,6 +561,33 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	r.updateStats(tilesTotal, tilesDirty, len(tiles), encodeTime, rasterTime, compositeTime, totalTime)
 
 	return nil
+}
+
+// orderTiles applies the optional test-only tile order hook. With no hook
+// installed it returns the input unchanged, so production scheduling is
+// identical to the row-major grid order.
+func (r *Renderer) orderTiles(tiles []*parallel.Tile) []*parallel.Tile {
+	if r.tileOrderHook != nil {
+		return r.tileOrderHook(tiles)
+	}
+	return tiles
+}
+
+// resetTileCmdTracker clears per-tile command tracking for a new render
+// pass. The backing array is reused when it still fits so callers holding the
+// previously installed slice observe the new data; a resize falls back to a
+// fresh allocation.
+func (r *Renderer) resetTileCmdTracker() {
+	if r.tileCmdTracker == nil {
+		return
+	}
+	n := r.tileGrid.TileCount()
+	if cap(r.tileCmdTracker) >= n {
+		r.tileCmdTracker = r.tileCmdTracker[:n]
+		clear(r.tileCmdTracker)
+	} else {
+		r.tileCmdTracker = make([][]int, n)
+	}
 }
 
 // renderTilesWithContext renders the scene encoding to the specified tiles in parallel
@@ -585,22 +657,40 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 	// Clear tile before rendering
 	clear(tile.Data)
 
-	// Acquire pooled resources for this tile
-	pm := r.pool.getPixmap(tileW, tileH)
+	// Acquire pooled resources for this tile. The optional pixmap hook
+	// intercepts temporary pixmap acquisition (test-only resource injection).
+	var pm *gg.Pixmap
+	if r.pixmapHook != nil {
+		pm = r.pixmapHook(tileW, tileH)
+	} else {
+		pm = r.pool.getPixmap(tileW, tileH)
+	}
 	sr := r.pool.getRenderer(tileW, tileH)
 	dec := r.pool.getDecoder(enc)
 
+	// Per-tile draw-command positions in the tag stream, captured when a
+	// command tracker is installed (determinism gate diagnostics).
+	var cmdPositions []int
+	trackCmds := r.tileCmdTracker != nil
+
 	// Render commands using gg.SoftwareRenderer
-	r.executeEncodingOnTile(dec, tile, pm, sr, images)
+	r.executeEncodingOnTile(dec, tile, pm, sr, images, trackCmds, &cmdPositions)
+
+	if trackCmds {
+		r.tileCmdTracker[tile.Y*r.tileGrid.TilesX()+tile.X] = cmdPositions
+	}
 
 	// Copy rendered pixmap data into the tile buffer.
 	// Pixmap stores premultiplied RGBA, same as tile.Data.
 	pmData := pm.Data()
 	copy(tile.Data, pmData)
 
-	// Return resources to pool
+	// Return resources to pool. A hooked pixmap is owned by the hook and
+	// must never enter the production pool.
+	if r.pixmapHook == nil {
+		r.pool.putPixmap(pm)
+	}
 	r.pool.putDecoder(dec)
-	r.pool.putPixmap(pm)
 	r.pool.putRenderer(sr)
 
 	tile.Dirty = true
@@ -618,7 +708,7 @@ type tileClipState struct {
 // rasterization to gg.SoftwareRenderer for analytic anti-aliased output.
 //
 //nolint:gocyclo,cyclop,gocognit,funlen // Command interpreter with multiple cases is inherently complex
-func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) { //nolint:maintidx // tag dispatch across all scene command types
+func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image, trackCmds bool, cmdPositions *[]int) { //nolint:maintidx // tag dispatch across all scene command types
 	// Reusable scene.Path for the decode loop — reset per TagBeginPath instead of allocating.
 	currentPath := r.pool.getScenePath()
 	defer r.pool.putScenePath(currentPath)
@@ -692,6 +782,9 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 			// Path is complete, ready for fill/stroke
 
 		case TagFill:
+			if trackCmds {
+				*cmdPositions = append(*cmdPositions, dec.Position()-1)
+			}
 			brush, style := dec.Fill()
 			if pathActive && !currentPath.IsEmpty() {
 				convertPathInto(currentPath, tileX, tileY, ggPath)
@@ -701,10 +794,16 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 			pathActive = false
 
 		case TagFillRoundRect:
+			if trackCmds {
+				*cmdPositions = append(*cmdPositions, dec.Position()-1)
+			}
 			brush, _, rect, rx, ry := dec.FillRoundRect()
 			renderFillRoundRect(pm, currentTransform, brush, rect, rx, ry, tileX, tileY)
 
 		case TagStroke:
+			if trackCmds {
+				*cmdPositions = append(*cmdPositions, dec.Position()-1)
+			}
 			brush, style := dec.Stroke()
 			if pathActive && !currentPath.IsEmpty() {
 				convertPathInto(currentPath, tileX, tileY, ggPath)
@@ -721,6 +820,9 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 			// CPU tile renderer: layer compositing (TODO: implement proper layer pop with alpha)
 
 		case TagBeginClip:
+			if trackCmds {
+				*cmdPositions = append(*cmdPositions, dec.Position()-1)
+			}
 			tileW := activePM.Width()
 			tileH := activePM.Height()
 
@@ -769,6 +871,9 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 			}
 
 		case TagImage:
+			if trackCmds {
+				*cmdPositions = append(*cmdPositions, dec.Position()-1)
+			}
 			imageIndex, imgTransform := dec.Image()
 			if int(imageIndex) < len(images) {
 				img := images[imageIndex]
@@ -778,6 +883,9 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 			}
 
 		case TagText:
+			if trackCmds {
+				*cmdPositions = append(*cmdPositions, dec.Position()-1)
+			}
 			run, glyphs, _, brush := dec.Text()
 			r.renderTextOnTile(run, glyphs, brush, currentTransform, tileX, tileY, activePM, sr, fillPaint)
 
@@ -1025,11 +1133,17 @@ func renderFillRoundRect(pm *gg.Pixmap, transform Affine, brush Brush, rect Rect
 	stride := tileW * 4
 
 	for py := startY; py < endY; py++ {
-		canvasY := float32(py+tileY) + 0.5
+		// SDF evaluation must use tile-LOCAL coordinates: pm, the pixel
+		// loop and the bounds below are all local. Subtracting the tile
+		// origin here (as the previous canvas-space formulation did) made
+		// coverage depend on the tile geometry, so the same rounded rect
+		// produced different AA pixels under non-64px tile sizes.
+		localY := float32(py) + 0.5
 		rowOff := py * stride
 		for px := startX; px < endX; px++ {
-			canvasX := float32(px+tileX) + 0.5
-			coverage := sdfRoundRectCoverage(canvasX, canvasY, cx, cy, halfW, halfH, radius)
+			localX := float32(px) + 0.5
+			coverage := sdfRoundRectCoverage(localX, localY,
+				cx-float32(tileX), cy-float32(tileY), halfW, halfH, radius)
 			if coverage <= 0 {
 				continue
 			}
@@ -1532,12 +1646,16 @@ func (r *Renderer) Resize(width, height int) {
 	r.width = width
 	r.height = height
 
-	// Resize tile grid
+	// Resize tile grid (preserves the configured tile geometry).
 	r.tileGrid.Resize(width, height)
 
 	// Resize dirty region
-	tilesX := (width + parallel.TileWidth - 1) / parallel.TileWidth
-	tilesY := (height + parallel.TileHeight - 1) / parallel.TileHeight
+	tileW, tileH := parallel.TileWidth, parallel.TileHeight
+	if r.testTileW > 0 && r.testTileH > 0 {
+		tileW, tileH = r.testTileW, r.testTileH
+	}
+	tilesX := (width + tileW - 1) / tileW
+	tilesY := (height + tileH - 1) / tileH
 	r.dirty = parallel.NewDirtyRegion(tilesX, tilesY)
 	r.dirty.MarkAll()
 }
