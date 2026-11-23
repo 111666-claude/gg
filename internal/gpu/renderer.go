@@ -394,6 +394,11 @@ func (r *GPUSceneRenderer) processCommandsWithContext(ctx context.Context, dec *
 		case tag == scene.TagImage:
 			imageIdx, transform := dec.Image()
 			r.renderImage(imageIdx, transform)
+		case tag == scene.TagInstance:
+			// The wgpu backend is a CPU-force stub (see NewGPUSceneRenderer)
+			// and has no recursive instance playback. Flatten instances with
+			// scene.Scene.Append on the CPU side before using this path.
+			return fmt.Errorf("%w: TagInstance requires scene.GPUSceneRenderer or flattened encoding", ErrEmptyScene)
 		}
 	}
 

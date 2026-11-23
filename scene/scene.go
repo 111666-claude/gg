@@ -66,6 +66,25 @@ type Scene struct {
 	// pathPool reuses Path objects to avoid per-shape allocations in Fill/Stroke.
 	// Each shape.ToPath() creates a new Path; pooling eliminates this overhead.
 	pathPool PathPool
+
+	// instances holds reusable sub-scene references attached via AddInstance.
+	// Each placement is also recorded as a TagInstance command in encoding.
+	instances []*Instance
+
+	// nextInstanceID assigns stable runtime IDs to attached instances.
+	nextInstanceID uint32
+
+	// frozen marks the scene as an immutable referenced sub-scene. Mutating
+	// a frozen scene panics; see Freeze/Unfreeze.
+	frozen bool
+
+	// attachDepth is the instance depth this scene occupies in the chain
+	// that attached it (0 for top-level hosts). Set by AddInstance.
+	attachDepth int
+
+	// referrers lists every Instance whose Child is this scene, enabling
+	// snapshot rebasing when the scene legitimately gains nested instances.
+	referrers []*Instance
 }
 
 // NewScene creates a new empty scene.
@@ -87,7 +106,9 @@ func NewScene() *Scene {
 }
 
 // Reset clears the scene for reuse without deallocating memory.
+// Panics if the scene is frozen as an immutable referenced sub-scene.
 func (s *Scene) Reset() {
+	s.checkMutable()
 	s.encoding.Reset()
 	s.layerStack.Reset()
 	s.transformStack = s.transformStack[:0]
@@ -100,6 +121,10 @@ func (s *Scene) Reset() {
 	s.lastEncodedAA = true
 	s.imageRegistry = s.imageRegistry[:0]
 	clear(s.fontRegistry)
+	s.instances = s.instances[:0]
+	s.nextInstanceID = 0
+	s.attachDepth = 0
+	s.referrers = s.referrers[:0]
 }
 
 // SetAntiAlias enables or disables anti-aliasing for subsequent fill and stroke
@@ -111,6 +136,7 @@ func (s *Scene) Reset() {
 //
 // Reference: Skia SkPaint::setAntiAlias, Cairo cairo_set_antialias.
 func (s *Scene) SetAntiAlias(enabled bool) {
+	s.checkMutable()
 	s.antiAlias = enabled
 	s.version++
 }
@@ -152,6 +178,7 @@ func (s *Scene) Fill(style FillStyle, transform Affine, brush Brush, shape Shape
 	if shape == nil {
 		return
 	}
+	s.checkMutable()
 
 	// Combine with current transform
 	combinedTransform := s.currentTransform.Multiply(transform)
@@ -214,6 +241,7 @@ func (s *Scene) Stroke(style *StrokeStyle, transform Affine, brush Brush, shape 
 	if shape == nil {
 		return
 	}
+	s.checkMutable()
 	if style == nil {
 		style = DefaultStrokeStyle()
 	}
@@ -267,6 +295,7 @@ func (s *Scene) DrawImage(img *Image, transform Affine) {
 	if img == nil {
 		return
 	}
+	s.checkMutable()
 
 	// Register image and get index
 	imageIdx := s.registerImage(img)
@@ -305,6 +334,7 @@ func (s *Scene) DrawImage(img *Image, transform Affine) {
 // All subsequent drawing operations will be rendered to this layer.
 // Call PopLayer to composite the layer with the content below.
 func (s *Scene) PushLayer(blend BlendMode, alpha float32, clip Shape) {
+	s.checkMutable()
 	clampedAlpha := clampAlpha(alpha)
 
 	layer := s.layerStack.AcquireLayer()
@@ -343,6 +373,7 @@ func (s *Scene) PushLayer(blend BlendMode, alpha float32, clip Shape) {
 // PopLayer pops the current layer and composites it with the content below.
 // Returns false if there's no layer to pop (only root layer remains).
 func (s *Scene) PopLayer() bool {
+	s.checkMutable()
 	if s.layerStack.IsRoot() {
 		return false
 	}
@@ -381,6 +412,7 @@ func (s *Scene) PopLayer() bool {
 // PushClip pushes a clip region. All subsequent drawing operations
 // will be clipped to this shape until PopClip is called.
 func (s *Scene) PushClip(shape Shape) {
+	s.checkMutable()
 	if shape == nil {
 		return
 	}
@@ -405,6 +437,7 @@ func (s *Scene) PushClip(shape Shape) {
 // PopClip pops the current clip region.
 // Returns false if there's no clip to pop.
 func (s *Scene) PopClip() bool {
+	s.checkMutable()
 	if s.clipStack.IsEmpty() {
 		return false
 	}
@@ -422,6 +455,7 @@ func (s *Scene) PopClip() bool {
 // PushTransform pushes a transform onto the transform stack.
 // The transform is concatenated with the current transform.
 func (s *Scene) PushTransform(t Affine) {
+	s.checkMutable()
 	s.transformStack = append(s.transformStack, s.currentTransform)
 	s.currentTransform = s.currentTransform.Multiply(t)
 	s.version++
@@ -430,6 +464,7 @@ func (s *Scene) PushTransform(t Affine) {
 // PopTransform pops the current transform from the stack.
 // Returns false if there's no transform to pop.
 func (s *Scene) PopTransform() bool {
+	s.checkMutable()
 	if len(s.transformStack) == 0 {
 		return false
 	}
@@ -442,6 +477,7 @@ func (s *Scene) PopTransform() bool {
 // SetTransform sets the current transform, replacing the existing one.
 // This does not affect the transform stack.
 func (s *Scene) SetTransform(t Affine) {
+	s.checkMutable()
 	s.currentTransform = t
 	s.version++
 }
@@ -453,18 +489,21 @@ func (s *Scene) Transform() Affine {
 
 // Translate applies a translation to the current transform.
 func (s *Scene) Translate(x, y float32) {
+	s.checkMutable()
 	s.currentTransform = s.currentTransform.Multiply(TranslateAffine(x, y))
 	s.version++
 }
 
 // Scale applies a scale to the current transform.
 func (s *Scene) Scale(x, y float32) {
+	s.checkMutable()
 	s.currentTransform = s.currentTransform.Multiply(ScaleAffine(x, y))
 	s.version++
 }
 
 // Rotate applies a rotation to the current transform (angle in radians).
 func (s *Scene) Rotate(angle float32) {
+	s.checkMutable()
 	s.currentTransform = s.currentTransform.Multiply(RotateAffine(angle))
 	s.version++
 }
@@ -519,8 +558,10 @@ func (s *Scene) Version() uint64 {
 }
 
 // TaggedBounds returns per-draw-command bounding boxes with stable IDs.
-// Used by DamageTracker (ADR-021) for frame-to-frame object diff.
+// Used by DamageTracker (ADR-021) for frame-to-frame object diff. Layers are
+// flattened first so bounds recorded on the root layer are included.
 func (s *Scene) TaggedBounds() []TaggedBounds {
+	s.flattenLayers()
 	return s.encoding.CommandBounds()
 }
 
@@ -537,15 +578,20 @@ func (s *Scene) IsEmpty() bool {
 // composing cached display lists from multiple RepaintBoundary nodes into a
 // single scene for rendering.
 //
-// The other scene is flattened (layers collapsed) before appending.
+// The other scene is flattened (layers collapsed) before appending. If the
+// other scene contains instances, their sub-scene references are adopted and
+// TagInstance ids are remapped; no child command streams or image pixels are
+// copied.
 func (s *Scene) Append(other *Scene) {
+	s.checkMutable()
 	if other == nil || other.IsEmpty() {
 		return
 	}
 	otherEnc := other.Encoding()
 	//nolint:gosec // image registry length is bounded
 	imageOffset := uint32(len(s.imageRegistry))
-	s.currentEncoding().AppendWithImages(otherEnc, imageOffset)
+	instanceOffset := s.adoptInstances(other, 0, 0)
+	s.currentEncoding().appendWithImagesAndInstances(otherEnc, imageOffset, instanceOffset)
 	s.imageRegistry = append(s.imageRegistry, other.imageRegistry...)
 	for id, src := range other.fontRegistry {
 		s.fontRegistry[id] = src
@@ -561,13 +607,15 @@ func (s *Scene) Append(other *Scene) {
 // local (0,0) into a parent at a specific position. Used by RepaintBoundary
 // scene composition (ADR-007 Phase 5).
 func (s *Scene) AppendWithTranslation(other *Scene, dx, dy float32) {
+	s.checkMutable()
 	if other == nil || other.IsEmpty() {
 		return
 	}
 	otherEnc := other.Encoding()
 	//nolint:gosec // image registry length is bounded
 	imageOffset := uint32(len(s.imageRegistry))
-	s.currentEncoding().AppendWithTranslation(otherEnc, dx, dy, imageOffset)
+	instanceOffset := s.adoptInstances(other, dx, dy)
+	s.currentEncoding().appendWithTranslationInstances(otherEnc, dx, dy, imageOffset, instanceOffset)
 	s.imageRegistry = append(s.imageRegistry, other.imageRegistry...)
 	for id, src := range other.fontRegistry {
 		s.fontRegistry[id] = src
@@ -578,6 +626,13 @@ func (s *Scene) AppendWithTranslation(other *Scene, dx, dy float32) {
 	ob.MinY += dy
 	ob.MaxX += dx
 	ob.MaxY += dy
+	// Recompute adopted instance bounds explicitly: their transforms now
+	// include (dx,dy) but other.Bounds() still holds the pre-shift values.
+	for _, in := range other.instances {
+		if in != nil {
+			ob = ob.Union(in.bounds())
+		}
+	}
 	s.bounds = s.bounds.Union(ob)
 	s.version++
 }
@@ -712,6 +767,7 @@ func (s *Scene) shapeToPath(shape Shape) *Path {
 // RegisterFont registers a FontSource in the scene's font registry.
 // Returns the FontSourceID used to reference this font in TagText commands.
 func (s *Scene) RegisterFont(source *text.FontSource) uint64 {
+	s.checkMutable()
 	id := computeSceneTextFontID(source)
 	s.fontRegistry[id] = source
 	return id

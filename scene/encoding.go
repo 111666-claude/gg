@@ -432,6 +432,11 @@ type Encoding struct {
 	// Used by DamageTracker for frame-to-frame object diff.
 	commandBounds []Rect
 
+	// instanceBounds accumulates bounds contributed by TagInstance commands
+	// only. It lets merges subtract the (child-local) instance bounds from
+	// e.bounds when the owning Scene recomputes them in host space.
+	instanceBounds Rect
+
 	// bounds tracks cumulative bounding box
 	bounds Rect
 
@@ -469,6 +474,7 @@ func (e *Encoding) Reset() {
 	e.brushes = e.brushes[:0]
 	e.commandBounds = e.commandBounds[:0]
 	e.bounds = EmptyRect()
+	e.instanceBounds = EmptyRect()
 	e.pathBounds = EmptyRect()
 	e.pathCount = 0
 	e.shapeCount = 0
@@ -809,17 +815,15 @@ func (e *Encoding) Append(other *Encoding) {
 	e.AppendWithImages(other, 0)
 }
 
-// AppendWithImages merges another Encoding into this one, adjusting both
-// brush indices and image indices by their respective offsets.
-// imageOffset is the number of images already registered in the target scene;
-// it shifts TagImage drawData entries so they reference the correct images
-// after merging two image registries.
-func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
+// appendWithImagesAndInstances is the full merge implementation used by
+// Scene.Append: it behaves like AppendWithImages and additionally remaps
+// TagInstance ids by instanceOffset. Instance pathData (transform, opacity,
+// blend) is copied verbatim — only the id in drawData is shifted.
+func (e *Encoding) appendWithImagesAndInstances(other *Encoding, imageOffset, instanceOffset uint32) {
 	if other == nil || len(other.tags) == 0 {
 		return
 	}
 
-	// Calculate brush index offset for the appended encoding
 	//nolint:gosec // brush slice length is bounded, overflow not possible in practice
 	brushOffset := uint32(len(e.brushes))
 
@@ -866,6 +870,13 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 				e.drawData[drawDataStart+drawIdx] += imageOffset
 			}
 			drawIdx++
+		case TagInstance:
+			// 1 uint32 id; the 8 pathData floats (transform, opacity,
+			// blend) are shared verbatim and need no adjustment.
+			if instanceOffset > 0 && drawIdx < len(other.drawData) {
+				e.drawData[drawDataStart+drawIdx] += instanceOffset
+			}
+			drawIdx++
 		case TagText:
 			if textOff+glyphRunDataSize <= len(other.textData) {
 				glyphCount := int(binary.LittleEndian.Uint16(other.textData[textOff+12:]))
@@ -885,12 +896,28 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 	// Append brushes
 	e.brushes = append(e.brushes, other.brushes...)
 
-	// Union bounds
+	// Carry per-command bounds so Scene.TaggedBounds survives layer
+	// flattening and scene-to-scene appends (ADR-021 damage tracking).
+	e.commandBounds = append(e.commandBounds, other.commandBounds...)
+
+	// Union bounds. Instance bounds are tracked separately because Scene
+	// append recomputes them in host space from the adopted Instance objects
+	// (the encoded values are child-local and cannot be shifted here).
+	e.instanceBounds = e.instanceBounds.Union(other.instanceBounds)
 	e.bounds = e.bounds.Union(other.bounds)
 
 	// Update statistics
 	e.pathCount += other.pathCount
 	e.shapeCount += other.shapeCount
+}
+
+// AppendWithImages merges another Encoding into this one, adjusting both
+// brush indices and image indices by their respective offsets.
+// imageOffset is the number of images already registered in the target scene;
+// it shifts TagImage drawData entries so they reference the correct images
+// after merging two image registries.
+func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
+	e.appendWithImagesAndInstances(other, imageOffset, 0)
 }
 
 // AppendWithTranslation merges another encoding with a translation offset
@@ -932,11 +959,17 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 // this switch will cause silent coordinate corruption. The default case
 // handles tags with zero pathData/drawData (markers, clip, pop).
 func (e *Encoding) AppendWithTranslation(other *Encoding, dx, dy float32, imageOffset uint32) {
+	e.appendWithTranslationInstances(other, dx, dy, imageOffset, 0)
+}
+
+// appendWithTranslationInstances is AppendWithTranslation with an additional
+// instanceOffset that remaps TagInstance ids into the target scene.
+func (e *Encoding) appendWithTranslationInstances(other *Encoding, dx, dy float32, imageOffset, instanceOffset uint32) {
 	if other == nil || len(other.tags) == 0 {
 		return
 	}
 	if dx == 0 && dy == 0 {
-		e.AppendWithImages(other, imageOffset)
+		e.appendWithImagesAndInstances(other, imageOffset, instanceOffset)
 		return
 	}
 
@@ -1019,6 +1052,20 @@ func (e *Encoding) AppendWithTranslation(other *Encoding, dx, dy float32, imageO
 			}
 			drawIdx++ // image index only; transform is in transforms stream
 
+		case TagInstance:
+			// drawData: 1 uint32 instance id → remap into the target scene.
+			if instanceOffset > 0 && drawIdx < len(other.drawData) {
+				e.drawData[drawDataStart+drawIdx] += instanceOffset
+			}
+			drawIdx++
+			// pathData: 6 transform floats + opacity + blend. Shift the
+			// translation components (C at +2, F at +5) exactly like path
+			// coordinates; Scene.adoptInstances applies the same shift to
+			// the registered Instance.Transform so both stay consistent.
+			e.pathData[pathStart+pathIdx+2] += dx
+			e.pathData[pathStart+pathIdx+5] += dy
+			pathIdx += 8
+
 		case TagText:
 			// Text data is in the textData stream. Handled in a second pass below.
 
@@ -1044,12 +1091,26 @@ func (e *Encoding) AppendWithTranslation(other *Encoding, dx, dy float32, imageO
 
 	e.brushes = append(e.brushes, other.brushes...)
 
+	// Carry per-command bounds with the same translation as the coordinates
+	// they describe, keeping Scene.TaggedBounds accurate after the merge.
+	start := len(e.commandBounds)
+	e.commandBounds = append(e.commandBounds, other.commandBounds...)
+	for i := start; i < len(e.commandBounds); i++ {
+		e.commandBounds[i].MinX += dx
+		e.commandBounds[i].MinY += dy
+		e.commandBounds[i].MaxX += dx
+		e.commandBounds[i].MaxY += dy
+	}
+
+	// Bounds cover non-instance content only; instance bounds live in
+	// instanceBounds and are owned by Scene.bounds (see EncodeInstance).
 	ob := other.bounds
 	ob.MinX += dx
 	ob.MinY += dy
 	ob.MaxX += dx
 	ob.MaxY += dy
 	e.bounds = e.bounds.Union(ob)
+	e.instanceBounds = e.instanceBounds.Union(other.instanceBounds)
 
 	e.pathCount += other.pathCount
 	e.shapeCount += other.shapeCount
@@ -1107,6 +1168,7 @@ func (e *Encoding) Clone() *Encoding {
 	copy(clone.brushes, e.brushes)
 
 	clone.bounds = e.bounds
+	clone.instanceBounds = e.instanceBounds
 	clone.pathBounds = e.pathBounds
 	clone.pathCount = e.pathCount
 	clone.shapeCount = e.shapeCount

@@ -45,10 +45,17 @@ func NewGPUSceneRenderer(dc *gg.Context) *GPUSceneRenderer {
 // boundaries only, ensuring that TagTransform inside a clip region does
 // not accidentally pop the clip's saved state.
 //
+// Reusable sub-scene instances (TagInstance) are traversed recursively with
+// their transform/opacity/blend/clip applied as a group; the child encoding
+// is never copied into the host.
+//
 // Returns nil if the scene is empty.
-func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cyclop,funlen,gocognit // tag dispatch across all scene command types
+func (r *GPUSceneRenderer) RenderScene(scene *Scene) error {
 	if scene == nil {
 		return nil
+	}
+	if err := scene.ValidateInstances(); err != nil {
+		return err
 	}
 
 	enc := scene.Encoding()
@@ -56,13 +63,7 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 		return nil
 	}
 
-	dec := NewDecoder(enc)
-	if dec == nil {
-		return nil
-	}
-
 	dc := r.dc
-	path := gg.NewPath()
 
 	// Save the initial matrix so we can compose scene transforms correctly
 	// and restore the original state after rendering.
@@ -70,25 +71,82 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 	// dc.Push()/Pop() to avoid interfering with clip Push/Pop nesting.
 	baseMatrix := dc.GetTransform()
 
+	frame := &gpuFrame{
+		r:          r,
+		dc:         dc,
+		rootScene:  scene,
+		ownerStack: []*Scene{scene},
+		baseMatrix: baseMatrix,
+		path:       gg.NewPath(),
+	}
+	if err := frame.renderEncoding(enc, nil, baseMatrix, 0); err != nil {
+		return err
+	}
+
+	// Restore the original matrix. Unlike the previous Push/Pop approach,
+	// SetTransform is a direct replacement so we restore explicitly.
+	dc.SetTransform(baseMatrix)
+
+	return nil
+}
+
+// gpuFrame carries per-RenderScene state across recursive instance playback.
+type gpuFrame struct {
+	r          *GPUSceneRenderer
+	dc         *gg.Context
+	rootScene  *Scene
+	ownerStack []*Scene
+	baseMatrix gg.Matrix
+	path       *gg.Path
+}
+
+// renderEncoding decodes enc through the context. When in is non-nil, enc is
+// an instanced child encoding and baseMatrix is the host's matrix at the
+// instance site; the instance group is isolated via PushLayer when it needs
+// opacity or non-default blending.
+//
+//nolint:gocyclo,cyclop,funlen,gocognit // tag dispatch across all scene command types
+func (f *gpuFrame) renderEncoding(enc *Encoding, in *Instance, baseMatrix gg.Matrix, depth int) error {
+	dec := NewDecoder(enc)
+	if dec == nil {
+		return nil
+	}
+
+	dc := f.dc
+	path := f.path
+
+	// Instance group isolation: render the child into a layer when its
+	// opacity or blend mode differs from the default source-over/opaque.
+	layerPushed := false
+	// currentMatrix is the full context transform for the next draw. For an
+	// instanced child, baseMatrix already includes the instance placement
+	// (playInstance pre-composes host*instance), so it is used directly as
+	// the seed — child encodings commonly omit TagTransform entirely.
+	currentMatrix := baseMatrix
+	if in != nil {
+		if in.Opacity < 1 || (in.Blend != BlendNormal && in.Blend != BlendSourceOver) {
+			dc.PushLayer(gg.BlendMode(in.Blend), float64(in.Opacity))
+			layerPushed = true
+		}
+	}
+	dc.SetTransform(currentMatrix)
+
 	for dec.Next() {
 		switch dec.Tag() {
 		case TagTransform:
 			a := dec.Transform()
-			// Apply scene transform composed with the context's base matrix.
-			// Scene transforms are absolute (full accumulated affine from the
-			// encoder, e.g. currentTransform.Multiply(perDrawTransform)), so we
-			// compose with baseMatrix to preserve any parent context transform
-			// (e.g. dc.Translate() called before RenderScene).
-			//
-			// Using Push/Pop here would corrupt clip state when TagTransform
-			// appears inside a BeginClip/EndClip region: the transform's Pop
-			// would undo the clip's Push, removing the clip before content is
-			// drawn. SetTransform avoids this by not touching the state stack.
 			sceneMatrix := gg.Matrix{
 				A: float64(a.A), B: float64(a.B), C: float64(a.C),
 				D: float64(a.D), E: float64(a.E), F: float64(a.F),
 			}
-			dc.SetTransform(baseMatrix.Multiply(sceneMatrix))
+			if in != nil {
+				// baseMatrix already contains host*instance; only compose
+				// the child-local transform on top.
+				currentMatrix = baseMatrix.Multiply(sceneMatrix)
+			} else {
+				currentMatrix = baseMatrix.Multiply(sceneMatrix)
+			}
+			dc.SetTransform(currentMatrix)
 
 		case TagBeginPath:
 			path.Clear()
@@ -170,16 +228,9 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 
 		case TagBeginClip:
 			// Push state before clip so EndClip can restore the previous clip
-			// level AND the transform that was active at clip time. Push/Pop
-			// here is correct: clips are strictly nested and each BeginClip
-			// has exactly one EndClip. No intermediate Pop can occur because
-			// TagTransform uses SetTransform (not Push/Pop).
+			// level AND the transform that was active at clip time.
 			dc.Push()
 			// Detect rectangular clips → hardware scissor (ClipRect).
-			// Non-rect clips → general path clip (depth buffer on GPU).
-			// ClipRect uses PushRect → IsRectOnly()=true → hardware scissor.
-			// Clip() uses PushPath → IsRectOnly()=false → depth clip path
-			// which may not be available in all rendering contexts.
 			shape := gg.DetectShape(path)
 			if shape.Kind == gg.ShapeRect {
 				x := shape.CenterX - shape.Width/2
@@ -201,37 +252,90 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 
 		case TagText:
 			run, glyphs, str, brush := dec.Text()
-			r.resolveText(scene, run, glyphs, str, brush)
+			fontScene := f.rootScene
+			if in != nil && in.Child != nil {
+				fontScene = in.Child
+			}
+			f.resolveText(fontScene, run, glyphs, str, brush)
 
 		case TagImage:
 			imageIndex, imgTransform := dec.Image()
-			r.resolveImage(scene, imageIndex, imgTransform)
+			imageScene := f.rootScene
+			if in != nil && in.Child != nil {
+				imageScene = in.Child
+			}
+			f.resolveImage(imageScene, imageIndex, imgTransform)
+
+		case TagInstance:
+			id, instTransform, opacity, blend := dec.Instance()
+			if err := f.playInstance(id, instTransform, opacity, blend, baseMatrix, depth); err != nil {
+				return err
+			}
 
 		default:
 			// Unknown tags are skipped by the decoder advancing tagIdx.
 		}
 	}
 
-	// Restore the original matrix. Unlike the previous Push/Pop approach,
-	// SetTransform is a direct replacement so we restore explicitly.
-	dc.SetTransform(baseMatrix)
-
+	if layerPushed {
+		dc.PopLayer()
+	}
 	return nil
+}
+
+// playInstance resolves one nested instance against the nearest enclosing
+// scene and recursively renders it. The encoded placement is carried on a
+// local copy so the shared registered Instance is never mutated.
+func (f *gpuFrame) playInstance(id uint32, transform Affine, opacity float32, blend BlendMode, hostMatrix gg.Matrix, depth int) error {
+	if depth >= MaxInstanceDepth {
+		return ErrInstanceDepthExceeded
+	}
+	owner := f.ownerStack[len(f.ownerStack)-1]
+	registered, ok := owner.InstanceByID(id)
+	if !ok || registered == nil || registered.Child == nil {
+		return ErrInstanceNotFound
+	}
+	if registered.Child.version != registered.childVersion {
+		return ErrInstanceMoved
+	}
+	if isSingular(transform) {
+		return ErrSingularMatrix
+	}
+	in := *registered
+	in.Transform = transform
+	in.Opacity = opacity
+	in.Blend = blend
+
+	m := transform
+	instanceMatrix := gg.Matrix{
+		A: float64(m.A), B: float64(m.B), C: float64(m.C),
+		D: float64(m.D), E: float64(m.E), F: float64(m.F),
+	}
+	childBase := hostMatrix.Multiply(instanceMatrix)
+
+	childEnc := in.Child.Encoding()
+	if childEnc == nil || childEnc.IsEmpty() {
+		return nil
+	}
+	f.ownerStack = append(f.ownerStack, in.Child)
+	err := f.renderEncoding(childEnc, &in, childBase, depth+1)
+	f.ownerStack = f.ownerStack[:len(f.ownerStack)-1]
+	return err
 }
 
 // resolveText resolves a TagText glyph run. Prefers DrawShapedGlyphs (no re-shaping)
 // with DrawString as fallback. Produces hinted, atlas-batched, DPI-aware text.
-func (r *GPUSceneRenderer) resolveText(scene *Scene, run GlyphRunData, glyphs []GlyphEntry, str string, brush Brush) {
+func (f *gpuFrame) resolveText(sourceScene *Scene, run GlyphRunData, glyphs []GlyphEntry, str string, brush Brush) {
 	if run.GlyphCount == 0 {
 		return
 	}
 
-	source := scene.fontRegistry[run.FontSourceID]
+	source := sourceScene.fontRegistry[run.FontSourceID]
 	if source == nil {
 		return
 	}
 
-	dc := r.dc
+	dc := f.dc
 	applySceneBrush(dc, brush)
 
 	prevFace := dc.Font()
@@ -256,16 +360,21 @@ func (r *GPUSceneRenderer) resolveText(scene *Scene, run GlyphRunData, glyphs []
 // the full affine transform (scale + translation). The transform encodes
 // scaleX in A, scaleY in E, translateX in C, translateY in F.
 //
-// Before this fix, only translation (C, F) was used — images rendered at
-// source pixel size, ignoring scale. On HiDPI displays where the scene
-// encodes an inverse-DPI affine (e.g. scale=0.5 for 2x Retina), this
-// caused SVG icons to appear 2x too large (ui#101 Thread C, gg#308).
-func (r *GPUSceneRenderer) resolveImage(scene *Scene, imageIndex uint32, transform Affine) {
-	images := scene.Images()
-	if int(imageIndex) >= len(images) {
-		return
+// When the image belongs to an instanced child scene, its child-local index
+// is resolved through the child's registry and mapped onto the host image
+// slice by pointer, so no image pixels are copied at attachment time.
+func (f *gpuFrame) resolveImage(sourceScene *Scene, imageIndex uint32, transform Affine) {
+	var img *Image
+	if int(imageIndex) < len(sourceScene.imageRegistry) {
+		img = sourceScene.imageRegistry[imageIndex]
 	}
-	img := images[imageIndex]
+	if sourceScene != f.rootScene && img != nil {
+		hostIdx, ok := f.lookupHostImage(img)
+		if !ok || int(hostIdx) >= len(f.rootScene.imageRegistry) {
+			return
+		}
+		img = f.rootScene.imageRegistry[hostIdx]
+	}
 	if img == nil || img.Width <= 0 || img.Height <= 0 || len(img.Data) < img.Width*img.Height*4 {
 		return
 	}
@@ -286,12 +395,23 @@ func (r *GPUSceneRenderer) resolveImage(scene *Scene, imageIndex uint32, transfo
 		dstH = -dstH
 	}
 
-	r.dc.DrawImageEx(buf, gg.DrawImageOptions{
+	f.dc.DrawImageEx(buf, gg.DrawImageOptions{
 		X:         float64(transform.C),
 		Y:         float64(transform.F),
 		DstWidth:  dstW,
 		DstHeight: dstH,
 	})
+}
+
+// lookupHostImage maps a child-scene image pointer to its index in the host
+// scene's merged registry.
+func (f *gpuFrame) lookupHostImage(img *Image) (uint32, bool) {
+	for i, registered := range f.rootScene.imageRegistry {
+		if registered == img {
+			return uint32(i), true //nolint:gosec // bounded by slice length
+		}
+	}
+	return 0, false
 }
 
 // applySceneBrush sets the gg.Context color from a scene.Brush.

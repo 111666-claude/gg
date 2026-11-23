@@ -412,6 +412,41 @@ func (d *Decoder) Text() (run GlyphRunData, glyphs []GlyphEntry, str string, bru
 }
 
 // ---------------------------------------------------------------------------
+// Instance Command Decoder
+// ---------------------------------------------------------------------------
+
+// Instance reads the current TagInstance command data.
+// Returns the instance id, the child-to-host transform, opacity and blend
+// mode. Only valid when Tag() == TagInstance.
+//
+// Stream layout:
+//   - drawData: 1 uint32 id
+//   - pathData: 6 transform floats, 1 opacity float, 1 blend-mode float
+func (d *Decoder) Instance() (id uint32, transform Affine, opacity float32, blend BlendMode) {
+	if d.drawIdx+1 > len(d.enc.drawData) {
+		return 0, IdentityAffine(), 1, BlendNormal
+	}
+	id = d.enc.drawData[d.drawIdx]
+	d.drawIdx++
+
+	if d.pathIdx+8 > len(d.enc.pathData) {
+		return id, IdentityAffine(), 1, BlendNormal
+	}
+	transform = Affine{
+		A: d.enc.pathData[d.pathIdx],
+		B: d.enc.pathData[d.pathIdx+1],
+		C: d.enc.pathData[d.pathIdx+2],
+		D: d.enc.pathData[d.pathIdx+3],
+		E: d.enc.pathData[d.pathIdx+4],
+		F: d.enc.pathData[d.pathIdx+5],
+	}
+	opacity = d.enc.pathData[d.pathIdx+6]
+	blend = BlendMode(math.Float32bits(d.enc.pathData[d.pathIdx+7]))
+	d.pathIdx += 8
+	return id, transform, opacity, blend
+}
+
+// ---------------------------------------------------------------------------
 // Utility Methods
 // ---------------------------------------------------------------------------
 

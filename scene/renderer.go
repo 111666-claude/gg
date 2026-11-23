@@ -167,6 +167,11 @@ type Renderer struct {
 	// Font registry for TagText resolution (set per-render from Scene).
 	fontRegistry map[uint64]*text.FontSource
 
+	// currentScene and fontRegistryScene are set per render so per-tile
+	// instance playback can resolve TagInstance ids and TagText fonts.
+	currentScene      *Scene
+	fontRegistryScene *Scene
+
 	// Statistics
 	stats     RenderStats
 	statsMu   sync.RWMutex
@@ -318,6 +323,12 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 		}
 	}
 
+	// Validate the instance graph before any tile work so cyclic, moved or
+	// over-deep references surface as explicit errors.
+	if err := scene.ValidateInstances(); err != nil {
+		return err
+	}
+
 	startTotal := time.Now()
 	r.statsMu.Lock()
 	r.stats = RenderStats{} // Reset stats
@@ -331,6 +342,12 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	enc := scene.Encoding()
 	images := scene.Images()
 	r.fontRegistry = scene.FontRegistry()
+	r.currentScene = scene
+	r.fontRegistryScene = scene
+	// Flatten every reachable sub-scene once on this goroutine. Per-tile
+	// workers must not call Encoding() themselves: flattenLayers mutates the
+	// layer stack and encoding, which is unsafe under parallel playback.
+	flattenInstanceTree(scene, map[*Scene]struct{}{})
 	encodeTime := time.Since(startEncode)
 
 	// Check for cancellation after encoding
@@ -411,7 +428,9 @@ func (r *Renderer) RenderWithDamage(target *gg.Pixmap, scene *Scene, tracker *Da
 		tracker.MarkRendered()
 		r.dirty.MarkAll()
 		err = r.RenderDirty(target, scene, nil)
-		return scene.encoding.Bounds().ImageRect(), err
+		// Scene.Bounds includes instanced sub-scenes; encoding.Bounds covers
+		// only non-instance commands and would report an empty rect here.
+		return scene.Bounds().ImageRect(), err
 	}
 
 	// Convert pixel damage rect to tile coordinates and mark dirty
@@ -461,11 +480,22 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 		dirtyRegion = r.dirty
 	}
 
+	// Reject broken instance graphs before scheduling tile work.
+	if err := scene.ValidateInstances(); err != nil {
+		return err
+	}
+
 	// Get the flattened encoding, image registry, and font registry.
 	startEncode := time.Now()
 	enc := scene.Encoding()
 	images := scene.Images()
 	r.fontRegistry = scene.FontRegistry()
+	r.currentScene = scene
+	r.fontRegistryScene = scene
+	// Flatten every reachable sub-scene once on this goroutine. Per-tile
+	// workers must not call Encoding() themselves: flattenLayers mutates the
+	// layer stack and encoding, which is unsafe under parallel playback.
+	flattenInstanceTree(scene, map[*Scene]struct{}{})
 	encodeTime := time.Since(startEncode)
 
 	// Check for cancellation after encoding
@@ -574,8 +604,13 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 		MaxY: float32(tileY + tileH),
 	}
 
-	// Check if encoding bounds intersect tile
-	encBounds := enc.Bounds()
+	// Check if scene bounds intersect tile. The scene bounds include
+	// instanced sub-scenes; the encoding's own bounds cover only the
+	// non-instance command content.
+	encBounds := r.currentScene.Bounds()
+	if encBounds.IsEmpty() {
+		encBounds = enc.Bounds()
+	}
 	if !rectIntersects(encBounds, tileBounds) {
 		// Clear tile if nothing to render
 		clear(tile.Data)
@@ -616,24 +651,10 @@ type tileClipState struct {
 
 // executeEncodingOnTile executes encoding commands on a single tile, delegating
 // rasterization to gg.SoftwareRenderer for analytic anti-aliased output.
-//
-//nolint:gocyclo,cyclop,gocognit,funlen // Command interpreter with multiple cases is inherently complex
-func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) { //nolint:maintidx // tag dispatch across all scene command types
+func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) {
 	// Reusable scene.Path for the decode loop — reset per TagBeginPath instead of allocating.
 	currentPath := r.pool.getScenePath()
 	defer r.pool.putScenePath(currentPath)
-	pathActive := false // true between TagBeginPath and fill/stroke/clip consume
-
-	currentTransform := IdentityAffine()
-
-	tileX, tileY, _, _ := tile.Bounds()
-
-	// activePM is the pixmap we currently render into. It starts as the tile
-	// pixmap but may be swapped to a temporary pixmap inside clip regions.
-	activePM := pm
-
-	// clipStack tracks nested clip states for BeginClip/EndClip pairs.
-	var clipStack []tileClipState
 
 	// Reusable gg.Path for convertPath — avoids per-fill/stroke allocation.
 	ggPath := r.pool.getGGPath()
@@ -643,155 +664,35 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 	fillPaint := r.pool.getFillPaint()
 	defer r.pool.putFillPaint(fillPaint)
 
-	for dec.Next() {
-		switch dec.Tag() {
-		case TagTransform:
-			currentTransform = dec.Transform()
+	// activePM is the pixmap we currently render into. It starts as the tile
+	// pixmap but may be swapped to a temporary pixmap inside clip regions or
+	// composited instances.
+	activePM := pm
 
-		case TagBeginPath:
-			currentPath.Reset()
-			pathActive = true
+	// clipStack tracks nested clip states for BeginClip/EndClip pairs.
+	var clipStack []tileClipState
 
-		case TagMoveTo:
-			x, y := dec.MoveTo()
-			if pathActive {
-				tx, ty := currentTransform.TransformPoint(x, y)
-				currentPath.MoveTo(tx, ty)
-			}
-
-		case TagLineTo:
-			x, y := dec.LineTo()
-			if pathActive {
-				tx, ty := currentTransform.TransformPoint(x, y)
-				currentPath.LineTo(tx, ty)
-			}
-
-		case TagQuadTo:
-			cx, cy, x, y := dec.QuadTo()
-			if pathActive {
-				tcx, tcy := currentTransform.TransformPoint(cx, cy)
-				tx, ty := currentTransform.TransformPoint(x, y)
-				currentPath.QuadTo(tcx, tcy, tx, ty)
-			}
-
-		case TagCubicTo:
-			c1x, c1y, c2x, c2y, x, y := dec.CubicTo()
-			if pathActive {
-				tc1x, tc1y := currentTransform.TransformPoint(c1x, c1y)
-				tc2x, tc2y := currentTransform.TransformPoint(c2x, c2y)
-				tx, ty := currentTransform.TransformPoint(x, y)
-				currentPath.CubicTo(tc1x, tc1y, tc2x, tc2y, tx, ty)
-			}
-
-		case TagClosePath:
-			if pathActive {
-				currentPath.Close()
-			}
-
-		case TagEndPath:
-			// Path is complete, ready for fill/stroke
-
-		case TagFill:
-			brush, style := dec.Fill()
-			if pathActive && !currentPath.IsEmpty() {
-				convertPathInto(currentPath, tileX, tileY, ggPath)
-				resetFillPaint(fillPaint, brush, style)
-				_ = sr.Fill(activePM, ggPath, fillPaint)
-			}
-			pathActive = false
-
-		case TagFillRoundRect:
-			brush, _, rect, rx, ry := dec.FillRoundRect()
-			renderFillRoundRect(pm, currentTransform, brush, rect, rx, ry, tileX, tileY)
-
-		case TagStroke:
-			brush, style := dec.Stroke()
-			if pathActive && !currentPath.IsEmpty() {
-				convertPathInto(currentPath, tileX, tileY, ggPath)
-				paint := convertStrokePaint(brush, style)
-				_ = sr.Stroke(activePM, ggPath, paint)
-			}
-			pathActive = false
-
-		case TagPushLayer:
-			_, alpha := dec.PushLayer()
-			_ = alpha // CPU tile renderer: layer alpha applied during compositing (TODO: implement per-layer alpha blending)
-
-		case TagPopLayer:
-			// CPU tile renderer: layer compositing (TODO: implement proper layer pop with alpha)
-
-		case TagBeginClip:
-			tileW := activePM.Width()
-			tileH := activePM.Height()
-
-			if pathActive && !currentPath.IsEmpty() {
-				// 1. Render clip path as white on a temporary pixmap to get coverage.
-				maskPM := r.pool.getPixmap(tileW, tileH)
-				convertPathInto(currentPath, tileX, tileY, ggPath)
-				resetFillPaint(fillPaint, Brush{Kind: BrushSolid, Color: gg.RGBA{R: 1, G: 1, B: 1, A: 1}}, FillNonZero)
-				_ = sr.Fill(maskPM, ggPath, fillPaint)
-
-				// 2. Extract alpha channel as R8 mask (reuse pooled buffer).
-				clipMask := r.pool.getClipMask(tileW * tileH)
-				extractAlphaMaskInto(maskPM, clipMask)
-				r.pool.putPixmap(maskPM)
-
-				// 3. Save current pixmap and allocate a fresh one for clipped content.
-				savedPM := activePM
-				activePM = r.pool.getPixmap(tileW, tileH)
-
-				// 4. Push clip state.
-				clipStack = append(clipStack, tileClipState{mask: clipMask, savedPM: savedPM})
-			} else {
-				// Empty clip path clips everything (fully transparent mask).
-				clipMask := r.pool.getClipMask(tileW * tileH)
-				savedPM := activePM
-				activePM = r.pool.getPixmap(tileW, tileH)
-				clipStack = append(clipStack, tileClipState{mask: clipMask, savedPM: savedPM})
-			}
-			pathActive = false // consumed by clip
-
-		case TagEndClip:
-			if len(clipStack) > 0 {
-				state := clipStack[len(clipStack)-1]
-				clipStack = clipStack[:len(clipStack)-1]
-
-				// Apply alpha mask to clipped content.
-				applyAlphaMask(activePM, state.mask)
-
-				// Composite masked content onto the saved pixmap (source-over).
-				compositePixmaps(state.savedPM, activePM)
-
-				// Return the temporary pixmap and clip mask, restore the saved pixmap.
-				r.pool.putPixmap(activePM)
-				r.pool.putClipMask(state.mask)
-				activePM = state.savedPM
-			}
-
-		case TagImage:
-			imageIndex, imgTransform := dec.Image()
-			if int(imageIndex) < len(images) {
-				img := images[imageIndex]
-				if img != nil && len(img.Data) >= img.Width*img.Height*4 {
-					blitImageToTile(img, imgTransform, tileX, tileY, activePM)
-				}
-			}
-
-		case TagText:
-			run, glyphs, _, brush := dec.Text()
-			r.renderTextOnTile(run, glyphs, brush, currentTransform, tileX, tileY, activePM, sr, fillPaint)
-
-		case TagSetAntiAlias:
-			aa := dec.AntiAlias()
-			sr.SetAntiAlias(aa)
-
-		case TagBrush:
-			// Brush definitions are stored in the brushes array and referenced
-			// by index from Fill/Stroke/Text commands. The TagBrush tag encodes
-			// inline RGBA data in pathData — advance the decoder past it.
-			dec.Brush()
-		}
+	// imageIndex maps child-scene image pointers to host registry indices so
+	// nested instance encodings resolve TagImage against the host images slice.
+	imageIndex := make(map[*Image]uint32, len(images))
+	for i, img := range images {
+		imageIndex[img] = uint32(i) //nolint:gosec // bounded by slice length
 	}
+
+	ctx := &instanceRenderContext{
+		r:          r,
+		tile:       tile,
+		images:     images,
+		imageIndex: imageIndex,
+		activePM:   &activePM,
+		clipStack:  &clipStack,
+		path:       currentPath,
+		ggPath:     ggPath,
+		fillPaint:  fillPaint,
+		rootScene:  r.currentScene,
+		ownerStack: []*Scene{r.currentScene},
+	}
+	ctx.run(dec, nil, IdentityAffine(), 0)
 
 	// Safety: if clip stack is not empty (unbalanced clips), composite remaining.
 	for len(clipStack) > 0 {
@@ -809,6 +710,336 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 	if activePM != pm {
 		copy(pm.Data(), activePM.Data())
 		r.pool.putPixmap(activePM)
+	}
+}
+
+// instanceRenderContext carries per-tile mutable state across recursive
+// instance playback. Slices referenced by pointer (activePM, clipStack) are
+// shared across recursion levels so clips opened by the host remain active
+// inside child instances and restore correctly on unwind.
+type instanceRenderContext struct {
+	r          *Renderer
+	tile       *parallel.Tile
+	images     []*Image
+	imageIndex map[*Image]uint32
+	activePM   **gg.Pixmap
+	clipStack  *[]tileClipState
+	path       *Path
+	ggPath     *gg.Path
+	fillPaint  *gg.Paint
+	rootScene  *Scene
+	// ownerStack[i] is the child scene whose instance registry resolves ids
+	// encoded at recursion depth i+1.
+	ownerStack []*Scene
+	// pathActive mirrors the old pathActive flag: true between TagBeginPath
+	// and the command that consumes the path.
+	pathActive bool
+}
+
+// run decodes enc onto the tile. When in is non-nil, enc is the child
+// instance's encoding and hostTransform is the host transform at the
+// instance site; child TagTransform values are composed with
+// hostTransform*in.Transform.
+//
+//nolint:gocyclo,cyclop,gocognit,funlen,maintidx // tag dispatch across all scene command types
+func (ctx *instanceRenderContext) run(dec *Decoder, in *Instance, hostTransform Affine, depth int) {
+	r := ctx.r
+	// Child encodings commonly contain no TagTransform (identity). Seed the
+	// current transform with host*instance so instance placement applies
+	// even before the first explicit transform tag; an explicit child
+	// TagTransform recomputes the same composition below.
+	currentTransform := IdentityAffine()
+	if in != nil {
+		currentTransform = hostTransform.Multiply(in.Transform)
+	}
+	tileX, tileY, _, _ := ctx.tile.Bounds()
+	sr := r.pool.getRenderer(ctx.tile.Width, ctx.tile.Height)
+	defer r.pool.putRenderer(sr)
+
+	// Group compositing state for this instance: when the instance needs
+	// isolation (opacity < 1 or non-source-over blend), content renders into
+	// a temporary pixmap and is composited on unwind.
+	var groupPM *gg.Pixmap
+	groupOpacity := float32(1)
+	groupBlend := BlendNormal
+	savedActive := *ctx.activePM
+	if in != nil {
+		groupOpacity = in.Opacity
+		groupBlend = in.Blend
+		if groupOpacity < 1 || (groupBlend != BlendNormal && groupBlend != BlendSourceOver) {
+			w, h := ctx.tile.Width, ctx.tile.Height
+			groupPM = r.pool.getPixmap(w, h)
+			*ctx.activePM = groupPM
+		}
+	}
+
+	for dec.Next() {
+		switch dec.Tag() {
+		case TagTransform:
+			t := dec.Transform()
+			if in != nil {
+				// Child-local point → instance space (t) → host space
+				// (in.Transform) → enclosing host transform.
+				currentTransform = hostTransform.Multiply(in.Transform.Multiply(t))
+			} else {
+				currentTransform = t
+			}
+
+		case TagBeginPath:
+			ctx.path.Reset()
+			ctx.pathActive = true
+
+		case TagMoveTo:
+			x, y := dec.MoveTo()
+			if ctx.pathActive {
+				tx, ty := currentTransform.TransformPoint(x, y)
+				ctx.path.MoveTo(tx, ty)
+			}
+
+		case TagLineTo:
+			x, y := dec.LineTo()
+			if ctx.pathActive {
+				tx, ty := currentTransform.TransformPoint(x, y)
+				ctx.path.LineTo(tx, ty)
+			}
+
+		case TagQuadTo:
+			cx, cy, x, y := dec.QuadTo()
+			if ctx.pathActive {
+				tcx, tcy := currentTransform.TransformPoint(cx, cy)
+				tx, ty := currentTransform.TransformPoint(x, y)
+				ctx.path.QuadTo(tcx, tcy, tx, ty)
+			}
+
+		case TagCubicTo:
+			c1x, c1y, c2x, c2y, x, y := dec.CubicTo()
+			if ctx.pathActive {
+				tc1x, tc1y := currentTransform.TransformPoint(c1x, c1y)
+				tc2x, tc2y := currentTransform.TransformPoint(c2x, c2y)
+				tx, ty := currentTransform.TransformPoint(x, y)
+				ctx.path.CubicTo(tc1x, tc1y, tc2x, tc2y, tx, ty)
+			}
+
+		case TagClosePath:
+			if ctx.pathActive {
+				ctx.path.Close()
+			}
+
+		case TagEndPath:
+			// Path is complete, ready for fill/stroke
+
+		case TagFill:
+			brush, style := dec.Fill()
+			if ctx.pathActive && !ctx.path.IsEmpty() {
+				convertPathInto(ctx.path, tileX, tileY, ctx.ggPath)
+				resetFillPaint(ctx.fillPaint, brush, style)
+				_ = sr.Fill(*ctx.activePM, ctx.ggPath, ctx.fillPaint)
+			}
+			ctx.pathActive = false
+
+		case TagFillRoundRect:
+			brush, _, rect, rx, ry := dec.FillRoundRect()
+			renderFillRoundRect(*ctx.activePM, currentTransform, brush, rect, rx, ry, tileX, tileY)
+
+		case TagStroke:
+			brush, style := dec.Stroke()
+			if ctx.pathActive && !ctx.path.IsEmpty() {
+				convertPathInto(ctx.path, tileX, tileY, ctx.ggPath)
+				paint := convertStrokePaint(brush, style)
+				_ = sr.Stroke(*ctx.activePM, ctx.ggPath, paint)
+			}
+			ctx.pathActive = false
+
+		case TagPushLayer:
+			_, alpha := dec.PushLayer()
+			_ = alpha // CPU tile renderer: layer alpha applied during compositing (TODO: implement per-layer alpha blending)
+
+		case TagPopLayer:
+			// CPU tile renderer: layer compositing (TODO: implement proper layer pop with alpha)
+
+		case TagBeginClip:
+			activePM := *ctx.activePM
+			tileW := activePM.Width()
+			tileH := activePM.Height()
+
+			if ctx.pathActive && !ctx.path.IsEmpty() {
+				// 1. Render clip path as white on a temporary pixmap to get coverage.
+				maskPM := r.pool.getPixmap(tileW, tileH)
+				convertPathInto(ctx.path, tileX, tileY, ctx.ggPath)
+				resetFillPaint(ctx.fillPaint, Brush{Kind: BrushSolid, Color: gg.RGBA{R: 1, G: 1, B: 1, A: 1}}, FillNonZero)
+				_ = sr.Fill(maskPM, ctx.ggPath, ctx.fillPaint)
+
+				// 2. Extract alpha channel as R8 mask (reuse pooled buffer).
+				clipMask := r.pool.getClipMask(tileW * tileH)
+				extractAlphaMaskInto(maskPM, clipMask)
+				r.pool.putPixmap(maskPM)
+
+				// 3. Save current pixmap and allocate a fresh one for clipped content.
+				savedPM := activePM
+				activePM = r.pool.getPixmap(tileW, tileH)
+
+				// 4. Push clip state.
+				*ctx.clipStack = append(*ctx.clipStack, tileClipState{mask: clipMask, savedPM: savedPM})
+			} else {
+				// Empty clip path clips everything (fully transparent mask).
+				clipMask := r.pool.getClipMask(tileW * tileH)
+				savedPM := activePM
+				activePM = r.pool.getPixmap(tileW, tileH)
+				*ctx.clipStack = append(*ctx.clipStack, tileClipState{mask: clipMask, savedPM: savedPM})
+			}
+			*ctx.activePM = activePM
+			ctx.pathActive = false // consumed by clip
+
+		case TagEndClip:
+			if len(*ctx.clipStack) > 0 {
+				st := (*ctx.clipStack)[len(*ctx.clipStack)-1]
+				*ctx.clipStack = (*ctx.clipStack)[:len(*ctx.clipStack)-1]
+
+				activePM := *ctx.activePM
+				// Apply alpha mask to clipped content.
+				applyAlphaMask(activePM, st.mask)
+
+				// Composite masked content onto the saved pixmap (source-over).
+				compositePixmaps(st.savedPM, activePM)
+
+				// Return the temporary pixmap and clip mask, restore the saved pixmap.
+				r.pool.putPixmap(activePM)
+				r.pool.putClipMask(st.mask)
+				*ctx.activePM = st.savedPM
+			}
+
+		case TagImage:
+			imageIndex, imgTransform := dec.Image()
+			ctx.resolveImage(imageIndex, imgTransform, in)
+
+		case TagText:
+			run, glyphs, _, brush := dec.Text()
+			fontScene := ctx.fontScene(in)
+			r.renderTextOnTileWith(run, glyphs, brush, currentTransform, tileX, tileY,
+				*ctx.activePM, sr, ctx.fillPaint, fontScene)
+
+		case TagSetAntiAlias:
+			aa := dec.AntiAlias()
+			sr.SetAntiAlias(aa)
+
+		case TagBrush:
+			// Brush definitions are stored in the brushes array and referenced
+			// by index from Fill/Stroke/Text commands. The TagBrush tag encodes
+			// inline RGBA data in pathData — advance the decoder past it.
+			dec.Brush()
+
+		case TagInstance:
+			id, instTransform, opacity, blend := dec.Instance()
+			ctx.playInstance(id, instTransform, opacity, blend, currentTransform, depth)
+		}
+	}
+
+	// Composite the isolated instance group back onto the enclosing pixmap.
+	if groupPM != nil {
+		dst := savedActive
+		if groupOpacity < 1 {
+			scalePixmapAlpha(groupPM, groupOpacity)
+		}
+		compositePixmapsBlend(dst, groupPM, groupBlend)
+		r.pool.putPixmap(groupPM)
+		*ctx.activePM = dst
+	}
+}
+
+// fontScene returns the scene whose font registry should resolve TagText
+// commands at this recursion level.
+func (ctx *instanceRenderContext) fontScene(in *Instance) *Scene {
+	if in != nil && in.Child != nil {
+		return in.Child
+	}
+	return ctx.r.fontRegistryScene
+}
+
+// resolveImage maps a TagImage index (interpreted inside the instanced
+// child's registry) onto the host image registry and blits it.
+func (ctx *instanceRenderContext) resolveImage(imageIndex uint32, imgTransform Affine, in *Instance) {
+	tileX, tileY, _, _ := ctx.tile.Bounds()
+
+	var img *Image
+	if in != nil && in.Child != nil {
+		if int(imageIndex) < len(in.Child.imageRegistry) {
+			img = in.Child.imageRegistry[imageIndex]
+		}
+		if img != nil {
+			hostIdx, ok := ctx.imageIndex[img]
+			if !ok || int(hostIdx) >= len(ctx.images) {
+				return
+			}
+			img = ctx.images[hostIdx]
+		}
+	} else if int(imageIndex) < len(ctx.images) {
+		img = ctx.images[imageIndex]
+	}
+
+	if img != nil && len(img.Data) >= img.Width*img.Height*4 {
+		blitImageToTile(img, imgTransform, tileX, tileY, *ctx.activePM)
+	}
+}
+
+// playInstance resolves and renders one nested instance. Structural problems
+// (missing/moved child, depth overflow, singular transform) are defensive
+// no-ops here; Scene.ValidateInstances surfaces them as explicit errors
+// before rendering starts.
+func (ctx *instanceRenderContext) playInstance(id uint32, instTransform Affine, opacity float32, blend BlendMode, hostTransform Affine, depth int) {
+	r := ctx.r
+	owner := ctx.ownerStack[len(ctx.ownerStack)-1]
+	registered, ok := owner.InstanceByID(id)
+	if !ok || registered == nil || registered.Child == nil {
+		return
+	}
+	if depth >= MaxInstanceDepth {
+		return
+	}
+	if registered.Child.version != registered.childVersion || isSingular(instTransform) {
+		return
+	}
+	// Tiles render in parallel, so never write the encoded placement back
+	// onto the shared *Instance. Use a per-playback copy carrying the
+	// authoritative transform/opacity/blend from the command stream.
+	in := *registered
+	in.Transform = instTransform
+	in.Opacity = opacity
+	in.Blend = blend
+
+	// Early-out: instance bounds (or clip) do not intersect this tile.
+	tileX, tileY, tileW, tileH := ctx.tile.Bounds()
+	tileBounds := Rect{
+		MinX: float32(tileX), MinY: float32(tileY),
+		MaxX: float32(tileX + tileW), MaxY: float32(tileY + tileH),
+	}
+	if !rectIntersects(in.bounds(), tileBounds) {
+		return
+	}
+
+	childEnc := in.Child.encoding
+	if childEnc == nil || childEnc.IsEmpty() {
+		return
+	}
+	childDec := r.pool.getDecoder(childEnc)
+	defer r.pool.putDecoder(childDec)
+	ctx.ownerStack = append(ctx.ownerStack, in.Child)
+	ctx.run(childDec, &in, hostTransform, depth+1)
+	ctx.ownerStack = ctx.ownerStack[:len(ctx.ownerStack)-1]
+}
+
+// flattenInstanceTree eagerly flattens every sub-scene reachable through
+// instances so per-tile playback can read the immutable root encoding without
+// triggering flattenLayers on worker goroutines.
+func flattenInstanceTree(s *Scene, seen map[*Scene]struct{}) {
+	if _, ok := seen[s]; ok {
+		return
+	}
+	seen[s] = struct{}{}
+	_ = s.Encoding()
+	for _, in := range s.instances {
+		if in != nil && in.Child != nil {
+			flattenInstanceTree(in.Child, seen)
+		}
 	}
 }
 
@@ -858,28 +1089,78 @@ func applyAlphaMask(pm *gg.Pixmap, mask []byte) {
 //
 //nolint:gosec // G115: Integer overflow is not possible - math is bounded to [0,255]
 func compositePixmaps(dst, src *gg.Pixmap) {
+	compositePixmapsBlend(dst, src, BlendSourceOver)
+}
+
+// scalePixmapAlpha multiplies every premultiplied channel of pm by opacity
+// [0,1]. Used to apply instance group opacity before compositing.
+//
+//nolint:gosec // G115: bounded float→byte conversion
+func scalePixmapAlpha(pm *gg.Pixmap, opacity float32) {
+	if opacity >= 1 {
+		return
+	}
+	if opacity <= 0 {
+		clear(pm.Data())
+		return
+	}
+	data := pm.Data()
+	scale := opacity
+	for i := 0; i+3 < len(data); i += 4 {
+		data[i] = clampByte(float32(data[i]) * scale)
+		data[i+1] = clampByte(float32(data[i+1]) * scale)
+		data[i+2] = clampByte(float32(data[i+2]) * scale)
+		data[i+3] = clampByte(float32(data[i+3]) * scale)
+	}
+}
+
+// compositePixmapsBlend composites src onto dst with the given scene blend
+// mode in premultiplied alpha space. The blend-mode functions operate on
+// straight byte channels of premultiplied colors, matching the convention in
+// internal/blend.
+//
+//nolint:gosec // G115: Integer overflow is not possible - math is bounded to [0,255]
+func compositePixmapsBlend(dst, src *gg.Pixmap, mode BlendMode) {
+	if dst == nil || src == nil {
+		return
+	}
 	dstData := dst.Data()
 	srcData := src.Data()
 	n := min(len(dstData), len(srcData))
-	for i := 0; i < n; i += 4 {
-		sa := srcData[i+3]
-		if sa == 0 {
-			continue // Fully transparent source, keep destination
+	if mode == BlendNormal || mode == BlendSourceOver {
+		// Inline fast path: identical to compositePixmaps.
+		for i := 0; i < n; i += 4 {
+			sa := srcData[i+3]
+			if sa == 0 {
+				continue
+			}
+			if sa == 255 {
+				dstData[i] = srcData[i]
+				dstData[i+1] = srcData[i+1]
+				dstData[i+2] = srcData[i+2]
+				dstData[i+3] = srcData[i+3]
+				continue
+			}
+			invAlpha := 255 - uint32(sa)
+			dstData[i] = srcData[i] + uint8((uint32(dstData[i])*invAlpha+127)/255)
+			dstData[i+1] = srcData[i+1] + uint8((uint32(dstData[i+1])*invAlpha+127)/255)
+			dstData[i+2] = srcData[i+2] + uint8((uint32(dstData[i+2])*invAlpha+127)/255)
+			dstData[i+3] = srcData[i+3] + uint8((uint32(dstData[i+3])*invAlpha+127)/255)
 		}
-		if sa == 255 {
-			// Fully opaque source, overwrite destination (fast path)
-			dstData[i] = srcData[i]
-			dstData[i+1] = srcData[i+1]
-			dstData[i+2] = srcData[i+2]
-			dstData[i+3] = srcData[i+3]
+		return
+	}
+	blendFn := mode.GetBlendFunc()
+	for i := 0; i < n; i += 4 {
+		// Fully transparent source leaves the destination untouched for
+		// every mode (avoids e.g. BlendClear erasing untouched pixels).
+		if srcData[i+3] == 0 {
 			continue
 		}
-		// Premultiplied source-over: dst' = src + dst * (1 - srcAlpha)
-		invAlpha := 255 - uint32(sa)
-		dstData[i] = srcData[i] + uint8((uint32(dstData[i])*invAlpha+127)/255)
-		dstData[i+1] = srcData[i+1] + uint8((uint32(dstData[i+1])*invAlpha+127)/255)
-		dstData[i+2] = srcData[i+2] + uint8((uint32(dstData[i+2])*invAlpha+127)/255)
-		dstData[i+3] = srcData[i+3] + uint8((uint32(dstData[i+3])*invAlpha+127)/255)
+		r, g, b, a := blendFn(
+			srcData[i], srcData[i+1], srcData[i+2], srcData[i+3],
+			dstData[i], dstData[i+1], dstData[i+2], dstData[i+3],
+		)
+		dstData[i], dstData[i+1], dstData[i+2], dstData[i+3] = r, g, b, a
 	}
 }
 
@@ -895,11 +1176,25 @@ func (r *Renderer) renderTextOnTile(
 	transform Affine, tileX, tileY int,
 	pm *gg.Pixmap, sr *gg.SoftwareRenderer, fillPaint *gg.Paint,
 ) {
+	r.renderTextOnTileWith(run, glyphs, brush, transform, tileX, tileY, pm, sr, fillPaint, r.fontRegistryScene)
+}
+
+// renderTextOnTileWith is renderTextOnTile with an explicit font-providing
+// scene, used when text commands belong to an instanced child scene whose
+// font registry differs from the host's.
+func (r *Renderer) renderTextOnTileWith(
+	run GlyphRunData, glyphs []GlyphEntry, brush Brush,
+	transform Affine, tileX, tileY int,
+	pm *gg.Pixmap, sr *gg.SoftwareRenderer, fillPaint *gg.Paint, fontScene *Scene,
+) {
 	if len(glyphs) == 0 || run.GlyphCount == 0 {
 		return
 	}
 
-	source := r.fontRegistry[run.FontSourceID]
+	var source *text.FontSource
+	if fontScene != nil {
+		source = fontScene.fontRegistry[run.FontSourceID]
+	}
 	if source == nil {
 		return
 	}

@@ -107,6 +107,17 @@ const (
 	// Resolution to pixels (atlas, outline, text op) is deferred to render time.
 	// See ADR-022.
 	TagText Tag = 0x60
+
+	// TagInstance references an immutable child Scene by instance ID.
+	// The owning Scene resolves the ID to its *Instance at render time; the
+	// child's commands are never copied into the host encoding.
+	// Data:
+	//   - drawData: 1 uint32 instance ID
+	//   - pathData: 6 float32 instance transform [a, b, c, d, e, f],
+	//               1 float32 opacity, 1 float32 blend mode
+	// A clip path (if any) is encoded immediately before TagInstance using
+	// the regular BeginPath…EndPath + BeginClip/EndClip sequence.
+	TagInstance Tag = 0x70
 )
 
 // String returns a human-readable name for the tag.
@@ -152,6 +163,8 @@ func (t Tag) String() string {
 		return "Image"
 	case TagText:
 		return "Text"
+	case TagInstance:
+		return "Instance"
 	default:
 		return unknownStr
 	}
