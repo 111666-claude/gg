@@ -64,6 +64,23 @@
 //	// Get the result
 //	img := s.Snapshot()
 //
+// # Sub-surfaces
+//
+// ImageSurface implements SubSurface: CreateSubSurface returns a surface
+// backed by a rectangular region of the parent, sharing the root pixel
+// storage (stride and origin) rather than copying. Coordinates on the
+// sub-surface are local to its bounds, and every draw lands directly in the
+// shared pixels, so it is visible through the parent and overlapping
+// siblings. Sub-surfaces can be nested, and SnapshotWith selects between an
+// independent copy and a zero-copy read-only view:
+//
+//	sub, err := s.CreateSubSurface(image.Rect(10, 10, 50, 50))
+//	if err != nil { /* invalid or closed */ }
+//	sub.Fill(path, surface.FillStyle{Color: color.RGBA{0, 0, 255, 255}})
+//	view := sub.(*surface.ImageSurface).SnapshotView() // shared pixels
+//
+// ImageSurface also implements ClippableSurface for path-based clipping.
+//
 // # Integration with gg.Context
 //
 // The surface package is designed to integrate with gg.Context (see INT-001).

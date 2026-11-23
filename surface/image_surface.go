@@ -4,17 +4,64 @@
 package surface
 
 import (
+	"errors"
 	"image"
 	"image/color"
 	"image/draw"
+	"sync"
 
 	"github.com/gogpu/gg/internal/raster"
 )
+
+// Shared pixel-storage errors.
+var (
+	// ErrSurfaceClosed is returned when an operation targets a closed
+	// surface, or a surface whose root has been closed.
+	ErrSurfaceClosed = errors.New("surface: surface is closed")
+
+	// ErrEmptySubSurface is returned when CreateSubSurface is given a
+	// zero-area region.
+	ErrEmptySubSurface = errors.New("surface: sub-surface bounds must be non-empty")
+
+	// ErrInvalidSubSurfaceBounds is returned when CreateSubSurface is given
+	// negative dimensions or a region outside the parent bounds.
+	ErrInvalidSubSurfaceBounds = errors.New("surface: invalid sub-surface bounds")
+)
+
+// sharedPixels is the state shared by a root ImageSurface and all of its
+// sub-surfaces. It owns the pixel storage (through the root image) and the
+// mutex that serializes every drawing operation on the whole surface tree.
+//
+// The mutex is shared on purpose: parent and child surfaces alias the same
+// pixels, so concurrent access through any two surfaces of the same tree
+// would otherwise race. A single lock makes the tree safe to share across
+// goroutines without forcing callers to coordinate which surface they hold.
+type sharedPixels struct {
+	mu sync.Mutex
+
+	// rootImg is the full-size image that owns the backing array.
+	// Sub-surfaces reference slices of rootImg.Pix via SubImage.
+	rootImg *image.RGBA
+
+	// rootClosed is set when the root surface is closed. A closed root
+	// invalidates every sub-surface even though the sub-surfaces themselves
+	// were never closed.
+	rootClosed bool
+}
 
 // ImageSurface is a CPU-based surface that renders to an *image.RGBA.
 //
 // It uses raster.AnalyticFiller for high-quality anti-aliased rendering.
 // This is the default surface implementation for software rendering.
+//
+// An ImageSurface created with NewImageSurface is a root surface and owns
+// its pixel storage. Surfaces created with CreateSubSurface share the root
+// storage: they describe a rectangular region through the root stride and an
+// origin, so drawing to a sub-surface is immediately visible on the parent
+// and on overlapping sibling sub-surfaces.
+//
+// All surfaces of one tree share a mutex; drawing operations are safe for
+// concurrent use across goroutines.
 //
 // Example:
 //
@@ -32,17 +79,43 @@ type ImageSurface struct {
 	height int
 	img    *image.RGBA
 
+	// origin is the top-left corner of this surface in root pixel
+	// coordinates. It is (0, 0) for a root surface.
+	origin image.Point
+
+	// bounds is the absolute rectangle (root pixel coordinates) covered by
+	// this surface. Local coordinates map to root coordinates by adding
+	// origin.
+	bounds image.Rectangle
+
+	// isRoot reports whether this surface owns the shared storage.
+	isRoot bool
+
+	// parent is the surface this one was created from, or nil for a root.
+	parent *ImageSurface
+
+	// shared is the storage and lock shared by the whole surface tree.
+	shared *sharedPixels
+
 	// filler provides analytic anti-aliasing
 	filler *raster.AnalyticFiller
 
 	// edgeBuilder converts paths to edges
 	edgeBuilder *raster.EdgeBuilder
 
-	// closed tracks if Close has been called
+	// clipMask is the per-pixel coverage mask for the current clip, in local
+	// coordinates. nil means clipping is disabled.
+	clipMask []uint8
+
+	// clipStack stores saved clip masks for PushClip/PopClip.
+	clipStack [][]uint8
+
+	// closed tracks if Close has been called on this specific surface.
 	closed bool
 }
 
 // NewImageSurface creates a new CPU-based surface with the given dimensions.
+// Non-positive dimensions are clamped to 1, matching the historical behavior.
 func NewImageSurface(width, height int) *ImageSurface {
 	if width <= 0 {
 		width = 1
@@ -51,18 +124,18 @@ func NewImageSurface(width, height int) *ImageSurface {
 		height = 1
 	}
 
-	return &ImageSurface{
-		width:       width,
-		height:      height,
-		img:         image.NewRGBA(image.Rect(0, 0, width, height)),
-		filler:      raster.NewAnalyticFiller(width, height),
-		edgeBuilder: raster.NewEdgeBuilder(2), // 4x AA quality
-	}
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	return newRootImageSurface(img)
 }
 
 // NewImageSurfaceFromImage creates a surface backed by an existing image.
 // The surface will render into the provided image directly.
 func NewImageSurfaceFromImage(img *image.RGBA) *ImageSurface {
+	return newRootImageSurface(img)
+}
+
+// newRootImageSurface builds the root surface for the given image.
+func newRootImageSurface(img *image.RGBA) *ImageSurface {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
@@ -71,8 +144,12 @@ func NewImageSurfaceFromImage(img *image.RGBA) *ImageSurface {
 		width:       width,
 		height:      height,
 		img:         img,
+		origin:      bounds.Min,
+		bounds:      bounds,
+		isRoot:      true,
+		shared:      &sharedPixels{rootImg: img},
 		filler:      raster.NewAnalyticFiller(width, height),
-		edgeBuilder: raster.NewEdgeBuilder(2),
+		edgeBuilder: raster.NewEdgeBuilder(2), // 4x AA quality
 	}
 }
 
@@ -86,11 +163,55 @@ func (s *ImageSurface) Height() int {
 	return s.height
 }
 
+// Origin returns the top-left corner of this surface in the root image's
+// pixel coordinate system. It is (0, 0) for a root surface.
+func (s *ImageSurface) Origin() image.Point {
+	return s.origin
+}
+
+// Bounds returns the absolute rectangle covered by this surface in root
+// pixel coordinates. A root surface returns its full image bounds; a
+// sub-surface returns the region it aliases.
+func (s *ImageSurface) Bounds() image.Rectangle {
+	return s.bounds
+}
+
+// Parent returns the surface this sub-surface was created from, or nil for a
+// root surface.
+func (s *ImageSurface) Parent() *ImageSurface {
+	return s.parent
+}
+
+// IsSubSurface reports whether this surface aliases a region of a parent.
+func (s *ImageSurface) IsSubSurface() bool {
+	return !s.isRoot
+}
+
+// aliveLocked reports whether the surface may accept drawing operations.
+// The caller must hold shared.mu.
+func (s *ImageSurface) aliveLocked() bool {
+	return !s.closed && !s.shared.rootClosed && s.img != nil
+}
+
+// begin locks the shared mutex and reports whether the surface is usable.
+// On a false return the mutex is not held; on a true return the caller must
+// unlock shared.mu (typically via defer).
+func (s *ImageSurface) begin() bool {
+	s.shared.mu.Lock()
+	if !s.aliveLocked() {
+		s.shared.mu.Unlock()
+		return false
+	}
+	return true
+}
+
 // Clear fills the entire surface with the given color.
+// Clear ignores the active clip; it always repaints the full local bounds.
 func (s *ImageSurface) Clear(c color.Color) {
-	if s.closed {
+	if !s.begin() {
 		return
 	}
+	defer s.shared.mu.Unlock()
 
 	r, g, b, a := c.RGBA()
 	//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
@@ -106,9 +227,13 @@ func (s *ImageSurface) Clear(c color.Color) {
 
 // Fill fills the given path using the specified style.
 func (s *ImageSurface) Fill(path *Path, style FillStyle) {
-	if s.closed || path == nil || path.IsEmpty() {
+	if path == nil || path.IsEmpty() {
 		return
 	}
+	if !s.begin() {
+		return
+	}
+	defer s.shared.mu.Unlock()
 
 	// Get fill color
 	fillColor := s.resolveColor(style.Color, style.Pattern)
@@ -143,9 +268,13 @@ func (s *ImageSurface) Fill(path *Path, style FillStyle) {
 
 // Stroke strokes the given path using the specified style.
 func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
-	if s.closed || path == nil || path.IsEmpty() {
+	if path == nil || path.IsEmpty() {
 		return
 	}
+	if !s.begin() {
+		return
+	}
+	defer s.shared.mu.Unlock()
 
 	// Get stroke color
 	strokeColor := s.resolveColor(style.Color, style.Pattern)
@@ -176,23 +305,40 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 }
 
 // DrawImage draws an image at the specified position.
+// If opts is nil, default options are used. When opts.DstRect is set, the
+// source is scaled into that rectangle (local coordinates); otherwise it is
+// blitted 1:1 at at.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
-	if s.closed || img == nil {
+	if img == nil || !s.begin() {
 		return
 	}
+	defer s.shared.mu.Unlock()
 
-	srcBounds := img.Bounds()
-	if opts != nil && opts.SrcRect != nil {
-		srcBounds = *opts.SrcRect
-	}
-
-	dstX := int(at.X)
-	dstY := int(at.Y)
-
+	// Preserve the historical convention: a nil opts means fully opaque,
+	// otherwise opts.Alpha is taken verbatim (0 = fully transparent).
 	alpha := 1.0
 	if opts != nil {
 		alpha = opts.Alpha
 	}
+	if opts != nil && opts.DstRect != nil {
+		s.drawImageScaled(img, opts, alpha)
+		return
+	}
+	s.drawImageBlit(img, at, opts, alpha)
+}
+
+// drawImageBlit performs the 1:1 nearest-neighbor blit.
+func (s *ImageSurface) drawImageBlit(img image.Image, at Point, opts *DrawImageOptions, alpha float64) {
+	srcBounds := img.Bounds()
+	if opts != nil && opts.SrcRect != nil {
+		srcBounds = *opts.SrcRect
+	}
+	if srcBounds.Empty() {
+		return
+	}
+
+	dstX := int(at.X)
+	dstY := int(at.Y)
 
 	// Simple nearest-neighbor blit for now
 	for sy := srcBounds.Min.Y; sy < srcBounds.Max.Y; sy++ {
@@ -211,6 +357,51 @@ func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptio
 			if alpha < 1.0 {
 				srcColor = s.applyAlpha(srcColor, alpha)
 			}
+			if !s.applyClip(dx, dy, &srcColor) {
+				continue
+			}
+			s.blendPixel(dx, dy, srcColor)
+		}
+	}
+}
+
+// drawImageScaled draws the source scaled into opts.DstRect (local coords).
+func (s *ImageSurface) drawImageScaled(img image.Image, opts *DrawImageOptions, alpha float64) {
+	srcBounds := img.Bounds()
+	if opts.SrcRect != nil {
+		srcBounds = *opts.SrcRect
+	}
+	if srcBounds.Empty() {
+		return
+	}
+
+	dstFull := opts.DstRect.Canon()
+	dst := dstFull.Intersect(image.Rect(0, 0, s.width, s.height))
+	if dst.Empty() {
+		return
+	}
+
+	dw := dstFull.Dx()
+	dh := dstFull.Dy()
+	if dw <= 0 || dh <= 0 {
+		return
+	}
+
+	bilinear := opts.Filter == FilterBilinear
+	sxScale := float64(srcBounds.Dx()) / float64(dw)
+	syScale := float64(srcBounds.Dy()) / float64(dh)
+
+	for dy := dst.Min.Y; dy < dst.Max.Y; dy++ {
+		fy := (float64(dy-dstFull.Min.Y)+0.5)*syScale - 0.5
+		for dx := dst.Min.X; dx < dst.Max.X; dx++ {
+			fx := (float64(dx-dstFull.Min.X)+0.5)*sxScale - 0.5
+			srcColor := sampleSource(img, srcBounds, fx, fy, bilinear)
+			if alpha < 1.0 {
+				srcColor = s.applyAlpha(srcColor, alpha)
+			}
+			if !s.applyClip(dx, dy, &srcColor) {
+				continue
+			}
 			s.blendPixel(dx, dy, srcColor)
 		}
 	}
@@ -222,31 +413,87 @@ func (s *ImageSurface) Flush() error {
 	return nil
 }
 
-// Snapshot returns a copy of the current surface contents.
+// Snapshot returns an independent copy of the current local contents.
+// The returned image never shares pixels with the surface, so it stays
+// valid after the surface is closed or drawn to again.
 func (s *ImageSurface) Snapshot() *image.RGBA {
-	if s.closed {
+	if !s.begin() {
 		return nil
 	}
+	defer s.shared.mu.Unlock()
 
+	return s.copySnapshotLocked()
+}
+
+// SnapshotWith returns the current local contents as an RGBA image.
+//
+// When copyPixels is true (equivalent to Snapshot) the returned image is an
+// independent copy. When false, a read-only view backed by the shared pixel
+// storage is returned without copying: it reflects later draws and must not
+// be modified by the caller, and becomes invalid once the root surface is
+// closed.
+func (s *ImageSurface) SnapshotWith(copyPixels bool) *image.RGBA {
+	if !s.begin() {
+		return nil
+	}
+	defer s.shared.mu.Unlock()
+
+	if copyPixels {
+		return s.copySnapshotLocked()
+	}
+	view, _ := s.img.SubImage(s.img.Bounds()).(*image.RGBA)
+	return view
+}
+
+// SnapshotView returns a zero-copy read-only view of the local contents,
+// backed by the shared pixel storage. See SnapshotWith for the semantics.
+func (s *ImageSurface) SnapshotView() *image.RGBA {
+	return s.SnapshotWith(false)
+}
+
+// copySnapshotLocked copies the local region into a tightly packed RGBA
+// image. Rows are copied individually because sub-surface images keep the
+// root stride. The caller must hold shared.mu.
+func (s *ImageSurface) copySnapshotLocked() *image.RGBA {
 	result := image.NewRGBA(image.Rect(0, 0, s.width, s.height))
-	copy(result.Pix, s.img.Pix)
+	rowBytes := s.width * 4
+	for y := 0; y < s.height; y++ {
+		srcOff := s.localPixOffset(0, y)
+		dstOff := result.PixOffset(0, y)
+		copy(result.Pix[dstOff:dstOff+rowBytes], s.img.Pix[srcOff:srcOff+rowBytes])
+	}
 	return result
 }
 
-// Close releases resources associated with the surface.
+// Close releases resources associated with this surface.
+//
+// Closing a sub-surface only releases that sub-surface's own rasterizers;
+// the shared pixel storage and every other surface of the tree keep working.
+// Closing the root surface invalidates the whole tree. Close is idempotent.
 func (s *ImageSurface) Close() error {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
+
 	if s.closed {
 		return nil
 	}
 	s.closed = true
+	if s.isRoot {
+		s.shared.rootClosed = true
+	}
+
 	s.img = nil
 	s.filler = nil
 	s.edgeBuilder = nil
+	s.clipMask = nil
+	s.clipStack = nil
 	return nil
 }
 
 // Image returns the underlying image.RGBA.
-// This is a direct reference, not a copy.
+// This is a direct reference, not a copy. For a sub-surface it is a
+// SubImage view sharing the root stride and pixel array.
+// Returns nil after Close.
 func (s *ImageSurface) Image() *image.RGBA {
 	return s.img
 }
@@ -254,14 +501,31 @@ func (s *ImageSurface) Image() *image.RGBA {
 // Capabilities returns the surface capabilities.
 func (s *ImageSurface) Capabilities() Capabilities {
 	return Capabilities{
-		SupportsSubSurface: false,
+		SupportsSubSurface: true,
 		SupportsResize:     false,
-		SupportsClipping:   false,
+		SupportsClipping:   true,
 		SupportsBlendModes: false,
 		SupportsAntialias:  true,
 		MaxWidth:           0, // Unlimited
 		MaxHeight:          0,
 	}
+}
+
+// applyClip multiplies the color's alpha by the clip coverage at (x, y).
+// It returns false when the clip rejects the pixel entirely.
+// A nil clip mask leaves the color untouched.
+func (s *ImageSurface) applyClip(x, y int, c *color.Color) bool {
+	if s.clipMask == nil {
+		return true
+	}
+	coverage := s.clipMask[y*s.width+x]
+	if coverage == 0 {
+		return false
+	}
+	if coverage != 255 {
+		*c = s.applyAlpha(*c, float64(coverage)/255.0)
+	}
+	return true
 }
 
 // resolveColor extracts color from Color or Pattern.
@@ -281,14 +545,36 @@ func (s *ImageSurface) resolveColor(c color.Color, _ Pattern) color.RGBA {
 	return color.RGBA{0, 0, 0, 255}
 }
 
-// blendRow blends alpha runs onto a scanline.
+// blendRow blends alpha runs onto a scanline, honoring the clip mask.
 func (s *ImageSurface) blendRow(y int, runs *raster.AlphaRuns, c color.RGBA) {
 	for x, alpha := range runs.Iter() {
 		if x < 0 || x >= s.width {
 			continue
 		}
+		if s.clipMask != nil {
+			alpha = multiplyCoverage(alpha, s.clipMask[y*s.width+x])
+			if alpha == 0 {
+				continue
+			}
+		}
 		s.blendPixelAlpha(x, y, c, alpha)
 	}
+}
+
+// multiplyCoverage combines rasterizer coverage with clip coverage.
+func multiplyCoverage(a, b uint8) uint8 {
+	return uint8(uint32(a) * uint32(b) / 255) //nolint:gosec // G115: result fits uint8
+}
+
+// localPixOffset returns the Pix index for a local (x, y) coordinate.
+//
+// A sub-surface image keeps the root Rect.Min (its origin), so the stdlib
+// PixOffset would subtract that origin and produce a negative index for
+// local coordinates. The pixel array of an image.RGBA is laid out so that
+// the local top-left corner sits at offset zero, hence a stride-based
+// offset works for both root surfaces and sub-surfaces.
+func (s *ImageSurface) localPixOffset(x, y int) int {
+	return y*s.img.Stride + x*4
 }
 
 // blendPixelAlpha blends a color with coverage alpha onto the image.
@@ -297,7 +583,7 @@ func (s *ImageSurface) blendPixelAlpha(x, y int, src color.RGBA, alpha uint8) {
 		return
 	}
 
-	idx := s.img.PixOffset(x, y)
+	idx := s.localPixOffset(x, y)
 
 	if alpha == 255 && src.A == 255 {
 		// Fully opaque - direct write
@@ -364,246 +650,76 @@ func (s *ImageSurface) applyAlpha(c color.Color, alpha float64) color.Color {
 	}
 }
 
-// expandStroke creates a filled path representing the stroke outline.
-// This is a simplified implementation using parallel offset curves.
-func (s *ImageSurface) expandStroke(path *Path, style StrokeStyle) *Path {
-	if style.Width <= 0 {
-		return nil
+// sampleSource samples img at fractional coordinates relative to srcBounds.
+// Bilinear sampling interpolates the four nearest pixels; nearest sampling
+// rounds toward the top-left.
+func sampleSource(img image.Image, srcBounds image.Rectangle, fx, fy float64, bilinear bool) color.Color {
+	if !bilinear {
+		x := srcBounds.Min.X + intFloor(fx)
+		y := srcBounds.Min.Y + intFloor(fy)
+		return img.At(clampInt(x, srcBounds.Min.X, srcBounds.Max.X-1),
+			clampInt(y, srcBounds.Min.Y, srcBounds.Max.Y-1))
 	}
 
-	halfWidth := style.Width / 2.0
-	result := NewPath()
+	x0 := clampInt(srcBounds.Min.X+intFloor(fx), srcBounds.Min.X, srcBounds.Max.X-1)
+	y0 := clampInt(srcBounds.Min.Y+intFloor(fy), srcBounds.Min.Y, srcBounds.Max.Y-1)
+	x1 := clampInt(x0+1, srcBounds.Min.X, srcBounds.Max.X-1)
+	y1 := clampInt(y0+1, srcBounds.Min.Y, srcBounds.Max.Y-1)
 
-	// Simple stroke expansion: create parallel paths
-	// This is a basic implementation; production code would handle
-	// caps, joins, and miters properly.
+	tx := clampF64(fx-float64(intFloor(fx)), 0, 1)
+	ty := clampF64(fy-float64(intFloor(fy)), 0, 1)
 
-	var segments []strokeSegment
-	var curX, curY, startX, startY float32
-
-	pointIdx := 0
-	for _, verb := range path.verbs {
-		switch verb {
-		case raster.MoveTo:
-			startX = path.points[pointIdx]
-			startY = path.points[pointIdx+1]
-			curX, curY = startX, startY
-			pointIdx += 2
-
-		case raster.LineTo:
-			x, y := path.points[pointIdx], path.points[pointIdx+1]
-			segments = append(segments, strokeSegment{
-				x0: curX, y0: curY,
-				x1: x, y1: y,
-			})
-			curX, curY = x, y
-			pointIdx += 2
-
-		case raster.QuadTo:
-			// Flatten quad to lines for stroke
-			cx, cy := path.points[pointIdx], path.points[pointIdx+1]
-			x, y := path.points[pointIdx+2], path.points[pointIdx+3]
-			s.flattenQuadForStroke(curX, curY, cx, cy, x, y, &segments)
-			curX, curY = x, y
-			pointIdx += 4
-
-		case raster.CubicTo:
-			// Flatten cubic to lines for stroke
-			c1x, c1y := path.points[pointIdx], path.points[pointIdx+1]
-			c2x, c2y := path.points[pointIdx+2], path.points[pointIdx+3]
-			x, y := path.points[pointIdx+4], path.points[pointIdx+5]
-			s.flattenCubicForStroke(curX, curY, c1x, c1y, c2x, c2y, x, y, &segments)
-			curX, curY = x, y
-			pointIdx += 6
-
-		case raster.Close:
-			if curX != startX || curY != startY {
-				segments = append(segments, strokeSegment{
-					x0: curX, y0: curY,
-					x1: startX, y1: startY,
-				})
-			}
-			curX, curY = startX, startY
-		}
-	}
-
-	if len(segments) == 0 {
-		return nil
-	}
-
-	// Create expanded outline
-	s.buildStrokeOutline(result, segments, halfWidth, style)
-	return result
+	return lerpColor(
+		lerpColor(img.At(x0, y0), img.At(x1, y0), tx),
+		lerpColor(img.At(x0, y1), img.At(x1, y1), tx),
+		ty,
+	)
 }
 
-// strokeSegment represents a line segment for stroke expansion.
-type strokeSegment struct {
-	x0, y0, x1, y1 float32
+// lerpColor linearly interpolates two colors in straight RGBA space.
+func lerpColor(c0, c1 color.Color, t float64) color.Color {
+	r0, g0, b0, a0 := c0.RGBA()
+	r1, g1, b1, a1 := c1.RGBA()
+	return color.RGBA64{
+		R: uint16(float64(r0)*(1-t) + float64(r1)*t), //nolint:gosec // G115: interpolated 16-bit value
+		G: uint16(float64(g0)*(1-t) + float64(g1)*t), //nolint:gosec // G115
+		B: uint16(float64(b0)*(1-t) + float64(b1)*t), //nolint:gosec // G115
+		A: uint16(float64(a0)*(1-t) + float64(a1)*t), //nolint:gosec // G115
+	}
 }
 
-// flattenQuadForStroke flattens a quadratic curve to line segments.
-func (s *ImageSurface) flattenQuadForStroke(x0, y0, cx, cy, x1, y1 float32, segments *[]strokeSegment) {
-	const tolerance = 0.5
-	s.flattenQuadRecursive(x0, y0, cx, cy, x1, y1, tolerance, 0, segments)
+func intFloor(x float64) int {
+	i := int(x)
+	if x < float64(i) {
+		return i - 1
+	}
+	return i
 }
 
-func (s *ImageSurface) flattenQuadRecursive(x0, y0, cx, cy, x1, y1, tol float32, depth int, segments *[]strokeSegment) {
-	if depth > 10 {
-		*segments = append(*segments, strokeSegment{x0, y0, x1, y1})
-		return
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
 	}
-
-	dx := x1 - x0
-	dy := y1 - y0
-	dcx := cx - x0
-	dcy := cy - y0
-	cross := dcx*dy - dcy*dx
-	lenSq := dx*dx + dy*dy
-
-	if lenSq < 1e-6 || cross*cross/lenSq < tol*tol {
-		*segments = append(*segments, strokeSegment{x0, y0, x1, y1})
-		return
+	if v > hi {
+		return hi
 	}
-
-	q0x := (x0 + cx) * 0.5
-	q0y := (y0 + cy) * 0.5
-	q1x := (cx + x1) * 0.5
-	q1y := (cy + y1) * 0.5
-	mx := (q0x + q1x) * 0.5
-	my := (q0y + q1y) * 0.5
-
-	s.flattenQuadRecursive(x0, y0, q0x, q0y, mx, my, tol, depth+1, segments)
-	s.flattenQuadRecursive(mx, my, q1x, q1y, x1, y1, tol, depth+1, segments)
+	return v
 }
 
-// flattenCubicForStroke flattens a cubic curve to line segments.
-func (s *ImageSurface) flattenCubicForStroke(x0, y0, c1x, c1y, c2x, c2y, x1, y1 float32, segments *[]strokeSegment) {
-	const tolerance = 0.5
-	s.flattenCubicRecursive(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tolerance, 0, segments)
+func clampF64(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
-func (s *ImageSurface) flattenCubicRecursive(x0, y0, c1x, c1y, c2x, c2y, x1, y1, tol float32, depth int, segments *[]strokeSegment) {
-	if depth > 10 {
-		*segments = append(*segments, strokeSegment{x0, y0, x1, y1})
-		return
-	}
-
-	dx := x1 - x0
-	dy := y1 - y0
-	lenSq := dx*dx + dy*dy
-
-	if lenSq < 1e-6 {
-		*segments = append(*segments, strokeSegment{x0, y0, x1, y1})
-		return
-	}
-
-	dc1x := c1x - x0
-	dc1y := c1y - y0
-	cross1 := dc1x*dy - dc1y*dx
-
-	dc2x := c2x - x0
-	dc2y := c2y - y0
-	cross2 := dc2x*dy - dc2y*dx
-
-	maxCross := cross1
-	if maxCross < 0 {
-		maxCross = -maxCross
-	}
-	if cross2 > maxCross {
-		maxCross = cross2
-	}
-	if -cross2 > maxCross {
-		maxCross = -cross2
-	}
-
-	if maxCross*maxCross/lenSq < tol*tol {
-		*segments = append(*segments, strokeSegment{x0, y0, x1, y1})
-		return
-	}
-
-	m01x := (x0 + c1x) * 0.5
-	m01y := (y0 + c1y) * 0.5
-	m12x := (c1x + c2x) * 0.5
-	m12y := (c1y + c2y) * 0.5
-	m23x := (c2x + x1) * 0.5
-	m23y := (c2y + y1) * 0.5
-	m012x := (m01x + m12x) * 0.5
-	m012y := (m01y + m12y) * 0.5
-	m123x := (m12x + m23x) * 0.5
-	m123y := (m12y + m23y) * 0.5
-	mx := (m012x + m123x) * 0.5
-	my := (m012y + m123y) * 0.5
-
-	s.flattenCubicRecursive(x0, y0, m01x, m01y, m012x, m012y, mx, my, tol, depth+1, segments)
-	s.flattenCubicRecursive(mx, my, m123x, m123y, m23x, m23y, x1, y1, tol, depth+1, segments)
-}
-
-// buildStrokeOutline creates the outline path from line segments.
-// Note: style parameter reserved for future cap/join handling.
-func (s *ImageSurface) buildStrokeOutline(result *Path, segments []strokeSegment, halfWidth float64, _ StrokeStyle) {
-	if len(segments) == 0 {
-		return
-	}
-
-	hw := float32(halfWidth)
-
-	// Forward pass: create one side of the stroke
-	type offsetPoint struct{ x, y float32 }
-	forward := make([]offsetPoint, 0, len(segments)+1)
-	backward := make([]offsetPoint, 0, len(segments)+1)
-
-	for i, seg := range segments {
-		dx := seg.x1 - seg.x0
-		dy := seg.y1 - seg.y0
-		length := float32(1e-10)
-		if dx != 0 || dy != 0 {
-			length = float32(sqrtf32(dx*dx + dy*dy))
-		}
-
-		// Normal vector
-		nx := -dy / length * hw
-		ny := dx / length * hw
-
-		if i == 0 {
-			// Start cap (butt for now)
-			forward = append(forward, offsetPoint{seg.x0 + nx, seg.y0 + ny})
-			backward = append(backward, offsetPoint{seg.x0 - nx, seg.y0 - ny})
-		}
-
-		// End of segment
-		forward = append(forward, offsetPoint{seg.x1 + nx, seg.y1 + ny})
-		backward = append(backward, offsetPoint{seg.x1 - nx, seg.y1 - ny})
-	}
-
-	// Build the outline path
-	if len(forward) > 0 {
-		result.MoveTo(float64(forward[0].x), float64(forward[0].y))
-		for i := 1; i < len(forward); i++ {
-			result.LineTo(float64(forward[i].x), float64(forward[i].y))
-		}
-	}
-
-	// Connect to backward side
-	for i := len(backward) - 1; i >= 0; i-- {
-		result.LineTo(float64(backward[i].x), float64(backward[i].y))
-	}
-
-	result.Close()
-}
-
-// sqrtf32 computes square root for float32.
-func sqrtf32(x float32) float32 {
-	if x <= 0 {
-		return 0
-	}
-	// Newton-Raphson iteration for sqrt
-	r := x
-	for i := 0; i < 3; i++ {
-		r = 0.5 * (r + x/r)
-	}
-	return r
-}
-
-// Verify ImageSurface implements Surface interface.
-var _ Surface = (*ImageSurface)(nil)
-var _ CapableSurface = (*ImageSurface)(nil)
+// Verify ImageSurface implements the surface interfaces.
+var (
+	_ Surface          = (*ImageSurface)(nil)
+	_ SubSurface       = (*ImageSurface)(nil)
+	_ ClippableSurface = (*ImageSurface)(nil)
+	_ CapableSurface   = (*ImageSurface)(nil)
+)

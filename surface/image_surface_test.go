@@ -207,6 +207,42 @@ func TestImageSurfaceCapabilities(t *testing.T) {
 	if !caps.SupportsAntialias {
 		t.Error("ImageSurface should support antialiasing")
 	}
+	if !caps.SupportsSubSurface {
+		t.Error("ImageSurface should support sub-surfaces")
+	}
+	if !caps.SupportsClipping {
+		t.Error("ImageSurface should support clipping")
+	}
+}
+
+// TestImageSurfaceClip verifies clip paths on a root surface.
+func TestImageSurfaceClip(t *testing.T) {
+	s := NewImageSurface(20, 20)
+	defer s.Close()
+	s.Clear(color.White)
+
+	clip := NewPath()
+	clip.Rectangle(4, 4, 8, 8)
+	s.SetClip(clip)
+
+	rect := NewPath()
+	rect.Rectangle(0, 0, 20, 20)
+	s.Fill(rect, FillStyle{Color: color.RGBA{255, 0, 0, 255}})
+
+	img := s.Snapshot()
+	if got := img.RGBAAt(8, 8); got.R != 255 || got.G != 0 {
+		t.Errorf("inside clip = %v, want red", got)
+	}
+	if got := img.RGBAAt(2, 2); got != (color.RGBA{255, 255, 255, 255}) {
+		t.Errorf("outside clip = %v, want white", got)
+	}
+
+	// A nil clip disables clipping again.
+	s.SetClip(nil)
+	s.Fill(rect, FillStyle{Color: color.RGBA{0, 255, 0, 255}})
+	if got := s.Snapshot().RGBAAt(2, 2); got.G != 255 {
+		t.Errorf("after SetClip(nil) = %v, want green everywhere", got)
+	}
 }
 
 // TestImageSurfaceImage tests direct image access.

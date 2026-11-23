@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ImageSurface` sub-surfaces** (`surface.CreateSubSurface`) — a sub-surface aliases a
+  rectangular region of its parent through the shared root stride and an origin, instead of
+  copying pixels. `Fill`, `Stroke`, `DrawImage` and `Clear` use local coordinates and write
+  straight into the shared storage, so draws are immediately visible on the parent, on nested
+  sub-surfaces and on overlapping siblings. Sub-surfaces can be nested; closing one releases only
+  its own rasterizers and never the parent storage, while closing the root invalidates the whole
+  tree. Invalid regions fail with `ErrEmptySubSurface` / `ErrInvalidSubSurfaceBounds` /
+  `ErrSurfaceClosed`. All surfaces of one tree share a mutex, so concurrent access across
+  goroutines is race-free. `Snapshot` still returns an independent copy; `SnapshotWith(false)` /
+  `SnapshotView` return a zero-copy read-only view. `ImageSurface` now also implements
+  `ClippableSurface` (`SetClip`, `ClearClip`, `PushClip`, `PopClip`) with anti-aliased coverage
+  masks, and `DrawImageOptions.DstRect` performs nearest/bilinear scaling.
+
 - **`render.NullDeviceHandle` implements `Features()` and `DownlevelCapabilities()`** (#529), as the
   gpucontext v0.31 `DeviceProvider` requires; both return zero values.
 
