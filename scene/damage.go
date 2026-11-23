@@ -6,6 +6,15 @@ import "image"
 // per-object bounding boxes. This is Level 1 of the four-level damage pipeline
 // (ADR-021): Object Diff → Tile Dirty → GPU Scissor → OS Present.
 //
+// Behavior notes:
+//   - Moved/resized objects damage the union of their old and new bounds;
+//     removed objects damage their last known bounds.
+//   - Duplicate IDs within one frame: the last occurrence is stored. Earlier
+//     occurrences are still diffed against the previous frame, so duplicates
+//     may produce extra (conservative, never missing) damage.
+//   - DamageTracker is NOT goroutine-safe. Use one tracker per render loop;
+//     the Renderer serializes its own internal state separately.
+//
 // Usage:
 //
 //	tracker := NewDamageTracker()

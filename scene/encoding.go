@@ -885,6 +885,11 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 	// Append brushes
 	e.brushes = append(e.brushes, other.brushes...)
 
+	// Append per-command bounds (ADR-021) so the merged encoding keeps a
+	// 1:1 mapping between bounded draw commands and commandBounds. Losing
+	// them here would silently disable DamageTracker and CommandIndex.
+	e.commandBounds = append(e.commandBounds, other.commandBounds...)
+
 	// Union bounds
 	e.bounds = e.bounds.Union(other.bounds)
 
@@ -1044,6 +1049,16 @@ func (e *Encoding) AppendWithTranslation(other *Encoding, dx, dy float32, imageO
 
 	e.brushes = append(e.brushes, other.brushes...)
 
+	// Append per-command bounds with the same translation applied to
+	// pathData, keeping the draw-command ↔ bounds mapping aligned.
+	for _, b := range other.commandBounds {
+		b.MinX += dx
+		b.MinY += dy
+		b.MaxX += dx
+		b.MaxY += dy
+		e.commandBounds = append(e.commandBounds, b)
+	}
+
 	ob := other.bounds
 	ob.MinX += dx
 	ob.MinY += dy
@@ -1105,6 +1120,9 @@ func (e *Encoding) Clone() *Encoding {
 
 	clone.brushes = make([]Brush, len(e.brushes))
 	copy(clone.brushes, e.brushes)
+
+	clone.commandBounds = make([]Rect, len(e.commandBounds))
+	copy(clone.commandBounds, e.commandBounds)
 
 	clone.bounds = e.bounds
 	clone.pathBounds = e.pathBounds

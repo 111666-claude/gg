@@ -5,6 +5,7 @@ import (
 	"image"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogpu/gg"
@@ -164,8 +165,25 @@ type Renderer struct {
 	tileSize int
 	workers  int
 
-	// Font registry for TagText resolution (set per-render from Scene).
-	fontRegistry map[uint64]*text.FontSource
+	// Command filtering index for dirty-region rendering (see cmdindex.go).
+	// Cached per (encoding, scene version); the cached index is immutable
+	// once published, so concurrent RenderDirty calls may share it.
+	indexMu      sync.Mutex
+	cmdIndex     *CommandIndex
+	indexEnc     *Encoding
+	indexVersion uint64
+	indexInit    bool
+
+	// renderMu serializes whole-frame renders. Tile buffers, the dirty
+	// region, and stats are shared mutable state, so concurrent
+	// Render/RenderDirty calls on one Renderer are defined to run one
+	// at a time (callers may still render concurrently on DISTINCT
+	// Renderer instances).
+	renderMu sync.Mutex
+
+	// Per-render command filter counters (reset at the start of each render).
+	cmdSkipped atomic.Int64
+	cmdTotal   atomic.Int64
 
 	// Statistics
 	stats     RenderStats
@@ -183,6 +201,13 @@ type RenderStats struct {
 	// Layer statistics
 	LayersCached   int
 	LayersRendered int
+
+	// Command filtering statistics (dirty renders only).
+	// CommandsTotal is the number of draw commands in the encoding;
+	// CommandsSkipped is how many command executions were skipped across
+	// all rendered tiles because their bounds provably miss the tile.
+	CommandsTotal   int
+	CommandsSkipped int
 
 	// Timing (durations for the last render)
 	TimeEncode    time.Duration
@@ -302,6 +327,9 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 		return nil
 	}
 
+	r.renderMu.Lock()
+	defer r.renderMu.Unlock()
+
 	// Check for cancellation at start
 	select {
 	case <-ctx.Done():
@@ -322,6 +350,8 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	r.statsMu.Lock()
 	r.stats = RenderStats{} // Reset stats
 	r.statsMu.Unlock()
+	r.cmdSkipped.Store(0)
+	r.cmdTotal.Store(0)
 
 	// Mark all tiles dirty for full render
 	r.dirty.MarkAll()
@@ -330,7 +360,7 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	startEncode := time.Now()
 	enc := scene.Encoding()
 	images := scene.Images()
-	r.fontRegistry = scene.FontRegistry()
+	fonts := scene.FontRegistry()
 	encodeTime := time.Since(startEncode)
 
 	// Check for cancellation after encoding
@@ -346,7 +376,7 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 
 	// Render tiles in parallel with context
 	startRaster := time.Now()
-	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images); err != nil {
+	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images, fonts, nil); err != nil {
 		return err
 	}
 	rasterTime := time.Since(startRaster)
@@ -392,12 +422,19 @@ func (r *Renderer) RenderDirty(target *gg.Pixmap, scene *Scene, dirty *parallel.
 // nothing changed (caller can skip GPU upload + present entirely).
 //
 // On first frame, renders everything (full scene).
+//
+// The whole damage-compute → mark → render sequence is serialized with
+// other renders on this Renderer, so concurrent callers each get a
+// consistent dirty region.
 func (r *Renderer) RenderWithDamage(target *gg.Pixmap, scene *Scene, tracker *DamageTracker) (
 	damageRect image.Rectangle, err error,
 ) {
 	if target == nil || scene == nil {
 		return image.Rectangle{}, nil
 	}
+
+	r.renderMu.Lock()
+	defer r.renderMu.Unlock()
 
 	objects := scene.TaggedBounds()
 	damage := tracker.ComputeDamage(objects)
@@ -410,11 +447,16 @@ func (r *Renderer) RenderWithDamage(target *gg.Pixmap, scene *Scene, tracker *Da
 	if tracker.IsFirstRender() {
 		tracker.MarkRendered()
 		r.dirty.MarkAll()
-		err = r.RenderDirty(target, scene, nil)
+		err = r.renderDirtyImpl(context.Background(), target, scene, nil)
 		return scene.encoding.Bounds().ImageRect(), err
 	}
 
-	// Convert pixel damage rect to tile coordinates and mark dirty
+	// Convert pixel damage rect to tile coordinates and mark dirty.
+	// The rect is inflated by the AA fringe first: anti-aliased edges of a
+	// changed object bleed up to 1px past its recorded bounds, and those
+	// fringe pixels must be re-rendered (both to draw the new fringe and to
+	// erase the old one).
+	damage = damage.Inset(-int(aaFringe))
 	tileW := r.tileSize
 	tileH := r.tileSize
 	tx0 := damage.Min.X / tileW
@@ -428,7 +470,7 @@ func (r *Renderer) RenderWithDamage(target *gg.Pixmap, scene *Scene, tracker *Da
 		}
 	}
 
-	err = r.RenderDirty(target, scene, nil)
+	err = r.renderDirtyImpl(context.Background(), target, scene, nil)
 	return damage, err
 }
 
@@ -443,6 +485,15 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 		return nil
 	}
 
+	r.renderMu.Lock()
+	defer r.renderMu.Unlock()
+
+	return r.renderDirtyImpl(ctx, target, scene, dirty)
+}
+
+// renderDirtyImpl is the unlocked body of RenderDirtyWithContext.
+// Callers must hold r.renderMu.
+func (r *Renderer) renderDirtyImpl(ctx context.Context, target *gg.Pixmap, scene *Scene, dirty *parallel.DirtyRegion) error {
 	// Check for cancellation at start
 	select {
 	case <-ctx.Done():
@@ -454,6 +505,8 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	r.statsMu.Lock()
 	r.stats = RenderStats{}
 	r.statsMu.Unlock()
+	r.cmdSkipped.Store(0)
+	r.cmdTotal.Store(0)
 
 	// Use provided dirty region or fall back to internal tracking
 	dirtyRegion := dirty
@@ -465,8 +518,14 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	startEncode := time.Now()
 	enc := scene.Encoding()
 	images := scene.Images()
-	r.fontRegistry = scene.FontRegistry()
+	fonts := scene.FontRegistry()
 	encodeTime := time.Since(startEncode)
+
+	// Build (or reuse) the command index for per-tile command filtering.
+	// A nil index means safety cannot be proven for this encoding — the
+	// tile renderer then replays the full command stream on every tile.
+	cmdIdx := r.commandIndexFor(enc, scene.Version())
+	r.cmdTotal.Store(int64(cmdIdx.GroupCount()))
 
 	// Check for cancellation after encoding
 	select {
@@ -493,7 +552,7 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 
 	// Render dirty tiles in parallel with context
 	startRaster := time.Now()
-	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images); err != nil {
+	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images, fonts, cmdIdx); err != nil {
 		return err
 	}
 	rasterTime := time.Since(startRaster)
@@ -505,9 +564,13 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	default:
 	}
 
-	// Composite dirty tiles to target
+	// Composite dirty tiles to target. Dirty tiles REPLACE their target
+	// region (copy, not blend): the tile was fully recomputed, and only
+	// replacement erases content that moved away or was removed. This
+	// differs from full Render, which blends to preserve a user-cleared
+	// background — damage pipelines own the whole target.
 	startComposite := time.Now()
-	r.compositeTiles(tiles, target)
+	r.compositeTilesCopy(tiles, target)
 	compositeTime := time.Since(startComposite)
 
 	// Update statistics
@@ -518,9 +581,40 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 	return nil
 }
 
+// commandIndexFor returns the cached CommandIndex for (enc, version),
+// rebuilding it when the scene changed.
+//
+// Cache policy (defined behavior for index updates and version rollback):
+//   - Same encoding and same version: reuse the cached index as-is.
+//   - Different encoding, or version changed in either direction (including
+//     version rollback, e.g. rendering an older/reset scene): rebuild from
+//     the current encoding. A rolled-back version is never trusted to match
+//     a previously cached index.
+//   - BuildCommandIndex may return nil (unprovable safety); the nil result
+//     is cached too, so pathological encodings fall back to full replay
+//     without paying the build cost every frame.
+//
+// The returned index is immutable and safe for concurrent use.
+func (r *Renderer) commandIndexFor(enc *Encoding, version uint64) *CommandIndex {
+	r.indexMu.Lock()
+	defer r.indexMu.Unlock()
+
+	if r.indexInit && r.indexEnc == enc && r.indexVersion == version {
+		return r.cmdIndex
+	}
+
+	idx := BuildCommandIndex(enc)
+	r.cmdIndex = idx
+	r.indexEnc = enc
+	r.indexVersion = version
+	r.indexInit = true
+	return idx
+}
+
 // renderTilesWithContext renders the scene encoding to the specified tiles in parallel
-// with cancellation support.
-func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel.Tile, enc *Encoding, target *gg.Pixmap, images []*Image) error {
+// with cancellation support. If cmdIdx is non-nil, each tile replays only the
+// commands whose bounds intersect it; otherwise the full stream is replayed.
+func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel.Tile, enc *Encoding, target *gg.Pixmap, images []*Image, fonts map[uint64]*text.FontSource, cmdIdx *CommandIndex) error {
 	if len(tiles) == 0 || enc == nil || enc.IsEmpty() {
 		return nil
 	}
@@ -547,7 +641,7 @@ func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel
 			default:
 			}
 		}
-		r.renderTile(tiles[i], enc, target, images)
+		r.renderTile(tiles[i], enc, target, images, fonts, cmdIdx)
 	})
 
 	// Check if context was canceled during execution
@@ -560,7 +654,10 @@ func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel
 }
 
 // renderTile renders the scene encoding to a single tile.
-func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, images []*Image) {
+// If cmdIdx is non-nil, only commands whose (fringe-expanded) bounds
+// intersect the tile are executed; state, clip, and layer commands always
+// run, preserving stream order and cross-tile correctness.
+func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, images []*Image, fonts map[uint64]*text.FontSource, cmdIdx *CommandIndex) {
 	if tile == nil || enc == nil {
 		return
 	}
@@ -582,6 +679,13 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 		return
 	}
 
+	// Compute the per-tile replay plan: which commands can affect this tile.
+	var plan *ReplayPlan
+	if cmdIdx != nil {
+		plan = cmdIdx.PlanForTile(tileBounds)
+		r.cmdSkipped.Add(int64(plan.Skipped()))
+	}
+
 	// Clear tile before rendering
 	clear(tile.Data)
 
@@ -591,7 +695,7 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 	dec := r.pool.getDecoder(enc)
 
 	// Render commands using gg.SoftwareRenderer
-	r.executeEncodingOnTile(dec, tile, pm, sr, images)
+	r.executeEncodingOnTile(dec, tile, pm, sr, images, fonts, plan)
 
 	// Copy rendered pixmap data into the tile buffer.
 	// Pixmap stores premultiplied RGBA, same as tile.Data.
@@ -617,8 +721,13 @@ type tileClipState struct {
 // executeEncodingOnTile executes encoding commands on a single tile, delegating
 // rasterization to gg.SoftwareRenderer for analytic anti-aliased output.
 //
+// If plan is non-nil, tags the plan excludes are skipped: their stream data
+// is consumed (so the decoder stays in sync) but they produce no output.
+// The plan only ever excludes draw-command groups whose bounds miss the
+// tile; state and structural commands always execute in stream order.
+//
 //nolint:gocyclo,cyclop,gocognit,funlen // Command interpreter with multiple cases is inherently complex
-func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) { //nolint:maintidx // tag dispatch across all scene command types
+func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image, fonts map[uint64]*text.FontSource, plan *ReplayPlan) { //nolint:maintidx // tag dispatch across all scene command types
 	// Reusable scene.Path for the decode loop — reset per TagBeginPath instead of allocating.
 	currentPath := r.pool.getScenePath()
 	defer r.pool.putScenePath(currentPath)
@@ -644,6 +753,10 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 	defer r.pool.putFillPaint(fillPaint)
 
 	for dec.Next() {
+		if plan != nil && !plan.Execute(dec.Position()-1) {
+			skipTagData(dec)
+			continue
+		}
 		switch dec.Tag() {
 		case TagTransform:
 			currentTransform = dec.Transform()
@@ -779,7 +892,7 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 
 		case TagText:
 			run, glyphs, _, brush := dec.Text()
-			r.renderTextOnTile(run, glyphs, brush, currentTransform, tileX, tileY, activePM, sr, fillPaint)
+			r.renderTextOnTile(run, glyphs, brush, currentTransform, tileX, tileY, activePM, sr, fillPaint, fonts)
 
 		case TagSetAntiAlias:
 			aa := dec.AntiAlias()
@@ -894,12 +1007,13 @@ func (r *Renderer) renderTextOnTile(
 	run GlyphRunData, glyphs []GlyphEntry, brush Brush,
 	transform Affine, tileX, tileY int,
 	pm *gg.Pixmap, sr *gg.SoftwareRenderer, fillPaint *gg.Paint,
+	fonts map[uint64]*text.FontSource,
 ) {
 	if len(glyphs) == 0 || run.GlyphCount == 0 {
 		return
 	}
 
-	source := r.fontRegistry[run.FontSourceID]
+	source := fonts[run.FontSourceID]
 	if source == nil {
 		return
 	}
@@ -1436,6 +1550,55 @@ func (r *Renderer) compositeTiles(tiles []*parallel.Tile, target *gg.Pixmap) {
 	})
 }
 
+// compositeTilesCopy copies rendered tiles to the target pixmap, REPLACING
+// the target pixels in the tile region instead of blending over them.
+// Used by dirty-region rendering, where each tile was fully recomputed and
+// the old target content (moved/removed objects) must be erased.
+func (r *Renderer) compositeTilesCopy(tiles []*parallel.Tile, target *gg.Pixmap) {
+	if len(tiles) == 0 || target == nil {
+		return
+	}
+
+	targetData := target.Data()
+	stride := target.Width() * 4
+
+	r.workerPool.ExecuteIndexed(len(tiles), func(i int) {
+		r.compositeTileCopy(tiles[i], targetData, stride)
+	})
+}
+
+// compositeTileCopy copies a single tile's data into the target buffer,
+// replacing the destination pixels (clipped to the canvas bounds).
+func (r *Renderer) compositeTileCopy(tile *parallel.Tile, dst []byte, dstStride int) {
+	tileX, tileY, _, _ := tile.Bounds()
+
+	srcStride := tile.Width * 4
+
+	for row := 0; row < tile.Height; row++ {
+		canvasY := tileY + row
+		if canvasY >= r.height {
+			break
+		}
+
+		dstRowStart := canvasY*dstStride + tileX*4
+		srcRowStart := row * srcStride
+
+		pixelsInRow := tile.Width
+		if tileX+pixelsInRow > r.width {
+			pixelsInRow = r.width - tileX
+		}
+		if pixelsInRow <= 0 {
+			continue
+		}
+
+		n := pixelsInRow * 4
+		if srcRowStart+n > len(tile.Data) || dstRowStart+n > len(dst) {
+			continue
+		}
+		copy(dst[dstRowStart:dstRowStart+n], tile.Data[srcRowStart:srcRowStart+n])
+	}
+}
+
 // compositeTile blends a single tile's data onto the target buffer using
 // premultiplied source-over alpha compositing. This preserves the user's
 // pre-existing background (e.g. a Clear(white) call) instead of overwriting it.
@@ -1503,6 +1666,8 @@ func (r *Renderer) updateStats(total, dirty, rendered int, encode, raster, compo
 	r.stats.TilesTotal = total
 	r.stats.TilesDirty = dirty
 	r.stats.TilesRendered = rendered
+	r.stats.CommandsTotal = int(r.cmdTotal.Load())
+	r.stats.CommandsSkipped = int(r.cmdSkipped.Load())
 	r.stats.TimeEncode = encode
 	r.stats.TimeRaster = raster
 	r.stats.TimeComposite = composite
@@ -1540,6 +1705,15 @@ func (r *Renderer) Resize(width, height int) {
 	tilesY := (height + parallel.TileHeight - 1) / parallel.TileHeight
 	r.dirty = parallel.NewDirtyRegion(tilesX, tilesY)
 	r.dirty.MarkAll()
+
+	// Invalidate the command index cache — tile geometry changed, so any
+	// cached per-tile plan assumptions no longer hold.
+	r.indexMu.Lock()
+	r.cmdIndex = nil
+	r.indexEnc = nil
+	r.indexVersion = 0
+	r.indexInit = false
+	r.indexMu.Unlock()
 }
 
 // Stats returns the current render statistics.

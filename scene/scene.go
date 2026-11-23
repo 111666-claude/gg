@@ -520,7 +520,9 @@ func (s *Scene) Version() uint64 {
 
 // TaggedBounds returns per-draw-command bounding boxes with stable IDs.
 // Used by DamageTracker (ADR-021) for frame-to-frame object diff.
+// Layers are flattened first so the returned bounds cover all content.
 func (s *Scene) TaggedBounds() []TaggedBounds {
+	s.flattenLayers()
 	return s.encoding.CommandBounds()
 }
 
