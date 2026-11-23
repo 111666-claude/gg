@@ -888,6 +888,12 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 	// Union bounds
 	e.bounds = e.bounds.Union(other.bounds)
 
+	// Keep per-command bounds aligned with the appended draw commands.
+	// Spatial indexing (CommandIndex) maps draw commands to these bounds by
+	// position; dropping them here would silently make every flattened scene
+	// unindexable (and break DamageTracker).
+	e.commandBounds = append(e.commandBounds, other.commandBounds...)
+
 	// Update statistics
 	e.pathCount += other.pathCount
 	e.shapeCount += other.shapeCount
@@ -1051,6 +1057,18 @@ func (e *Encoding) AppendWithTranslation(other *Encoding, dx, dy float32, imageO
 	ob.MaxY += dy
 	e.bounds = e.bounds.Union(ob)
 
+	// Keep per-command bounds aligned with appended draw commands, shifted by
+	// the same translation as the path coordinates they describe.
+	base := len(e.commandBounds)
+	e.commandBounds = append(e.commandBounds, other.commandBounds...)
+	for i := base; i < len(e.commandBounds); i++ {
+		b := &e.commandBounds[i]
+		b.MinX += dx
+		b.MinY += dy
+		b.MaxX += dx
+		b.MaxY += dy
+	}
+
 	e.pathCount += other.pathCount
 	e.shapeCount += other.shapeCount
 }
@@ -1090,6 +1108,9 @@ func (e *Encoding) Clone() *Encoding {
 
 	clone.tags = make([]Tag, len(e.tags))
 	copy(clone.tags, e.tags)
+
+	clone.commandBounds = make([]Rect, len(e.commandBounds))
+	copy(clone.commandBounds, e.commandBounds)
 
 	clone.pathData = make([]float32, len(e.pathData))
 	copy(clone.pathData, e.pathData)

@@ -106,6 +106,22 @@ func (d *Decoder) Position() int {
 	return d.tagIdx
 }
 
+// Seek positions all stream cursors at a previously captured decoder state.
+// It is used by the spatial index replay path to resume decoding at an
+// arbitrary draw command without walking the preceding stream.
+//
+// Seek only writes the Decoder's own cursors; the Encoding is never modified.
+// The state must come from a Decoder over the same Encoding (see
+// CommandIndex), and no bounds checking is performed beyond the next Next call.
+func (d *Decoder) Seek(tagIdx, pathIdx, drawIdx, transIdx, textIdx int) {
+	d.tagIdx = tagIdx
+	d.pathIdx = pathIdx
+	d.drawIdx = drawIdx
+	d.transIdx = transIdx
+	d.textIdx = textIdx
+	d.currentTag = 0
+}
+
 // ---------------------------------------------------------------------------
 // Path Command Decoders
 // ---------------------------------------------------------------------------

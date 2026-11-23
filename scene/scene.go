@@ -524,6 +524,43 @@ func (s *Scene) TaggedBounds() []TaggedBounds {
 	return s.encoding.CommandBounds()
 }
 
+// QueryVisible returns draw commands whose recorded bounds intersect rect,
+// in original recording order.
+//
+// The scene is flattened first so layer content appears in the root encoding,
+// then a spatial index is built over the per-command bounds. If the encoding
+// cannot be indexed (dynamic text bounds, direct encoding calls, clip
+// commands, NaN bounds), QueryVisible returns nil and ok=false; callers must
+// then fall back to scanning the full command stream. A nil result with
+// ok=true means the scene is validly indexable but nothing intersects.
+//
+// QueryVisible does not modify the encoding, any decoder, or the scene's
+// version.
+func (s *Scene) QueryVisible(rect Rect) (refs []CommandRef, ok bool) {
+	if s == nil {
+		return nil, false
+	}
+	enc := s.Encoding()
+	idx := buildCommandIndex(enc, s.imageRegistry, s.version)
+	if idx == nil {
+		return nil, false
+	}
+	return idx.Query(rect), true
+}
+
+// BuildCommandIndex returns a spatial index over this scene's draw commands,
+// or nil when the scene cannot be indexed (see BuildCommandIndex).
+//
+// The scene is flattened before indexing, so layer content participates.
+// The returned index is a snapshot; retain it only while the scene is
+// unchanged (compare Scene.Version()).
+func (s *Scene) BuildCommandIndex() *CommandIndex {
+	if s == nil {
+		return nil
+	}
+	return buildCommandIndex(s.Encoding(), s.imageRegistry, s.version)
+}
+
 // IsEmpty returns true if the scene has no content.
 func (s *Scene) IsEmpty() bool {
 	return s.encoding.IsEmpty() && s.layerStack.Root().IsEmpty()

@@ -167,10 +167,25 @@ type Renderer struct {
 	// Font registry for TagText resolution (set per-render from Scene).
 	fontRegistry map[uint64]*text.FontSource
 
-	// Statistics
+	// Stats
 	stats     RenderStats
 	statsMu   sync.RWMutex
 	lastFrame time.Time
+
+	// Spatial command index (opt-in; see WithSpatialIndex).
+	//
+	// indexMu serializes build/swap. index is immutable once published, so
+	// per-tile reads need no lock. builtVersion/builtEnc identify the scene
+	// state the index describes; builtLayoutLen/builtDrawLen catch in-place
+	// encoding mutation that did not bump the version.
+	indexMu        sync.Mutex
+	spatialIndex   bool
+	index          *CommandIndex
+	builtVersion   uint64
+	builtEnc       *Encoding
+	builtLayoutLen int
+	builtDrawLen   int
+	indexFallbacks int
 }
 
 // RenderStats contains performance statistics for a render operation.
@@ -229,6 +244,23 @@ func WithTileSize(size int) RendererOption {
 func WithCache(cache *LayerCache) RendererOption {
 	return func(r *Renderer) {
 		r.cache = cache
+	}
+}
+
+// WithSpatialIndex enables the per-tile spatial command index.
+//
+// When enabled, Render and RenderDirty query an index built from the scene's
+// per-command bounds instead of replaying the whole command stream for every
+// tile. This pays off when a scene holds many primitives but each tile sees
+// only a few of them; for small scenes it is close to neutral.
+//
+// The index is rebuilt automatically when the scene version changes. Scenes
+// that cannot be indexed safely (dynamic text bounds, clip commands, direct
+// Encoding calls, resized images) transparently fall back to a full scan, so
+// output is identical either way. Disabled by default.
+func WithSpatialIndex() RendererOption {
+	return func(r *Renderer) {
+		r.spatialIndex = true
 	}
 }
 
@@ -344,9 +376,12 @@ func (r *Renderer) RenderWithContext(ctx context.Context, target *gg.Pixmap, sce
 	tiles := r.tileGrid.AllTiles()
 	tilesTotal := len(tiles)
 
+	// Prepare the spatial index once per render, outside the tile loop.
+	idx := r.prepareIndex(scene, enc)
+
 	// Render tiles in parallel with context
 	startRaster := time.Now()
-	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images); err != nil {
+	if err := r.renderTilesWithContext(ctx, tiles, enc, idx, target, images); err != nil {
 		return err
 	}
 	rasterTime := time.Since(startRaster)
@@ -491,9 +526,12 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 		}
 	}
 
+	// Prepare the spatial index once per render, outside the tile loop.
+	idx := r.prepareIndex(scene, enc)
+
 	// Render dirty tiles in parallel with context
 	startRaster := time.Now()
-	if err := r.renderTilesWithContext(ctx, tiles, enc, target, images); err != nil {
+	if err := r.renderTilesWithContext(ctx, tiles, enc, idx, target, images); err != nil {
 		return err
 	}
 	rasterTime := time.Since(startRaster)
@@ -519,8 +557,9 @@ func (r *Renderer) RenderDirtyWithContext(ctx context.Context, target *gg.Pixmap
 }
 
 // renderTilesWithContext renders the scene encoding to the specified tiles in parallel
-// with cancellation support.
-func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel.Tile, enc *Encoding, target *gg.Pixmap, images []*Image) error {
+// with cancellation support. When idx is non-nil each tile replays only the
+// indexed visible commands; otherwise the full stream is scanned per tile.
+func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel.Tile, enc *Encoding, idx *CommandIndex, target *gg.Pixmap, images []*Image) error {
 	if len(tiles) == 0 || enc == nil || enc.IsEmpty() {
 		return nil
 	}
@@ -547,7 +586,7 @@ func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel
 			default:
 			}
 		}
-		r.renderTile(tiles[i], enc, target, images)
+		r.renderTile(tiles[i], enc, idx, target, images)
 	})
 
 	// Check if context was canceled during execution
@@ -560,7 +599,7 @@ func (r *Renderer) renderTilesWithContext(ctx context.Context, tiles []*parallel
 }
 
 // renderTile renders the scene encoding to a single tile.
-func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, images []*Image) {
+func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, idx *CommandIndex, _ *gg.Pixmap, images []*Image) {
 	if tile == nil || enc == nil {
 		return
 	}
@@ -591,7 +630,11 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 	dec := r.pool.getDecoder(enc)
 
 	// Render commands using gg.SoftwareRenderer
-	r.executeEncodingOnTile(dec, tile, pm, sr, images)
+	if idx != nil {
+		r.executeIndexedOnTile(idx, dec, tile, pm, sr, images)
+	} else {
+		r.executeEncodingOnTile(dec, tile, pm, sr, images)
+	}
 
 	// Copy rendered pixmap data into the tile buffer.
 	// Pixmap stores premultiplied RGBA, same as tile.Data.
@@ -612,6 +655,195 @@ func (r *Renderer) renderTile(tile *parallel.Tile, enc *Encoding, _ *gg.Pixmap, 
 type tileClipState struct {
 	mask    []byte     // R8 alpha mask (tileW * tileH)
 	savedPM *gg.Pixmap // the pixmap we were drawing to before this clip
+}
+
+// ---------------------------------------------------------------------------
+// Spatial index integration
+// ---------------------------------------------------------------------------
+
+// prepareIndex returns the command index to use for a render, or nil to fall
+// back to a full scan. It is called once per render, before tiles are
+// dispatched.
+//
+// An index is reused only when it still describes the current scene state:
+// same encoding, same version, and unchanged stream layout. Otherwise it is
+// rebuilt. Builds take indexMu; reads of the published index do not, because a
+// *CommandIndex is immutable once published.
+func (r *Renderer) prepareIndex(scene *Scene, enc *Encoding) *CommandIndex {
+	if !r.spatialIndex || scene == nil || enc == nil || enc.IsEmpty() {
+		return nil
+	}
+
+	version := scene.Version()
+	layoutLen := len(enc.tags) + len(enc.pathData) + len(enc.drawData) + len(enc.transforms) + len(enc.textData)
+	drawLen := len(enc.commandBounds)
+
+	r.indexMu.Lock()
+	defer r.indexMu.Unlock()
+
+	if r.index != nil &&
+		r.builtEnc == enc &&
+		r.builtVersion == version &&
+		r.builtLayoutLen == layoutLen &&
+		r.builtDrawLen == drawLen {
+		return r.index
+	}
+
+	// Drop the stale index before rebuilding so a failed build cannot leave a
+	// structurally outdated index reachable.
+	idx := buildCommandIndex(enc, scene.Images(), version)
+	r.index = idx
+	r.builtEnc = enc
+	r.builtVersion = version
+	r.builtLayoutLen = layoutLen
+	r.builtDrawLen = drawLen
+
+	if idx == nil {
+		r.indexFallbacks++
+	}
+	return idx
+}
+
+// executeIndexedOnTile renders only the indexed visible commands onto one
+// tile. It is the spatial-index counterpart of executeEncodingOnTile: same
+// drawing semantics, but each selected command is replayed by seeking the
+// decoder to the command's segment instead of walking every prior tag.
+//
+// Commands are replayed in ascending index order, so painting order matches a
+// full scan. Scene clipping is not indexable (BuildCommandIndex rejects it).
+func (r *Renderer) executeIndexedOnTile(idx *CommandIndex, dec *Decoder, tile *parallel.Tile, pm *gg.Pixmap, sr *gg.SoftwareRenderer, images []*Image) {
+	tileX, tileY, tileW, tileH := tile.Bounds()
+	tileBounds := Rect{
+		MinX: float32(tileX),
+		MinY: float32(tileY),
+		MaxX: float32(tileX + tileW),
+		MaxY: float32(tileY + tileH),
+	}
+
+	// Pooled scratch state reused across every visible command on this tile.
+	currentPath := r.pool.getScenePath()
+	defer r.pool.putScenePath(currentPath)
+	ggPath := r.pool.getGGPath()
+	defer r.pool.putGGPath(ggPath)
+	fillPaint := r.pool.getFillPaint()
+	defer r.pool.putFillPaint(fillPaint)
+
+	refs := idx.queryReuse(nil, tileBounds)
+
+	lastAA := true
+	sr.SetAntiAlias(true)
+	for _, ref := range refs {
+		span := idx.span(ref.Index)
+		idx.replayCommand(dec, span, currentPath, tileX, tileY, pm, sr, ggPath, fillPaint, images, &lastAA)
+	}
+}
+
+// replayCommand seeks the decoder to a command's segment and draws it.
+// Returns false if the segment did not end in the expected draw tag.
+//
+//nolint:gocyclo,cyclop,funlen // mirrors the command dispatch of executeEncodingOnTile
+func (idx *CommandIndex) replayCommand(
+	dec *Decoder, span commandSpan, currentPath *Path,
+	tileX, tileY int, pm *gg.Pixmap, sr *gg.SoftwareRenderer,
+	ggPath *gg.Path, fillPaint *gg.Paint, images []*Image, lastAA *bool,
+) bool {
+	dec.Seek(span.tagStart, span.pathStart, span.drawStart, span.transStart, span.textStart)
+	currentPath.Reset()
+
+	if span.antiAlias != *lastAA {
+		sr.SetAntiAlias(span.antiAlias)
+		*lastAA = span.antiAlias
+	}
+	currentTransform := span.transform
+
+	for dec.Next() {
+		switch dec.Tag() {
+		case TagTransform:
+			currentTransform = dec.Transform()
+
+		case TagBeginPath:
+			currentPath.Reset()
+
+		case TagMoveTo:
+			x, y := dec.MoveTo()
+			tx, ty := currentTransform.TransformPoint(x, y)
+			currentPath.MoveTo(tx, ty)
+
+		case TagLineTo:
+			x, y := dec.LineTo()
+			tx, ty := currentTransform.TransformPoint(x, y)
+			currentPath.LineTo(tx, ty)
+
+		case TagQuadTo:
+			cx, cy, x, y := dec.QuadTo()
+			tcx, tcy := currentTransform.TransformPoint(cx, cy)
+			tx, ty := currentTransform.TransformPoint(x, y)
+			currentPath.QuadTo(tcx, tcy, tx, ty)
+
+		case TagCubicTo:
+			c1x, c1y, c2x, c2y, x, y := dec.CubicTo()
+			tc1x, tc1y := currentTransform.TransformPoint(c1x, c1y)
+			tc2x, tc2y := currentTransform.TransformPoint(c2x, c2y)
+			tx, ty := currentTransform.TransformPoint(x, y)
+			currentPath.CubicTo(tc1x, tc1y, tc2x, tc2y, tx, ty)
+
+		case TagClosePath:
+			currentPath.Close()
+
+		case TagEndPath:
+			// Path is complete; the draw tag follows.
+
+		case TagSetAntiAlias:
+			aa := dec.AntiAlias()
+			sr.SetAntiAlias(aa)
+			*lastAA = aa
+
+		case TagPushLayer, TagPopLayer:
+			// CPU tile rendering treats layers as no-ops; consume the payload to
+			// keep the draw stream aligned. Layer alpha is not applied here in a
+			// full scan either.
+			if dec.Tag() == TagPushLayer {
+				dec.PushLayer()
+			}
+
+		case TagBrush:
+			dec.Brush()
+
+		case TagFill:
+			brush, style := dec.Fill()
+			if !currentPath.IsEmpty() {
+				convertPathInto(currentPath, tileX, tileY, ggPath)
+				resetFillPaint(fillPaint, brush, style)
+				_ = sr.Fill(pm, ggPath, fillPaint)
+			}
+			return true
+
+		case TagFillRoundRect:
+			brush, _, rect, rx, ry := dec.FillRoundRect()
+			renderFillRoundRect(pm, currentTransform, brush, rect, rx, ry, tileX, tileY)
+			return true
+
+		case TagStroke:
+			brush, style := dec.Stroke()
+			if !currentPath.IsEmpty() {
+				convertPathInto(currentPath, tileX, tileY, ggPath)
+				paint := convertStrokePaint(brush, style)
+				_ = sr.Stroke(pm, ggPath, paint)
+			}
+			return true
+
+		case TagImage:
+			imageIndex, imgTransform := dec.Image()
+			if int(imageIndex) < len(images) {
+				img := images[imageIndex]
+				if img != nil && len(img.Data) >= img.Width*img.Height*4 {
+					blitImageToTile(img, imgTransform, tileX, tileY, pm)
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // executeEncodingOnTile executes encoding commands on a single tile, delegating
@@ -1540,6 +1772,17 @@ func (r *Renderer) Resize(width, height int) {
 	tilesY := (height + parallel.TileHeight - 1) / parallel.TileHeight
 	r.dirty = parallel.NewDirtyRegion(tilesX, tilesY)
 	r.dirty.MarkAll()
+}
+
+// IndexFallbacks reports how many renders could not build a spatial index and
+// fell back to a full command scan. Non-zero indicates the scene contains
+// content the index cannot describe safely (text, clips, direct encoding) or
+// that an image was resized after recording. Only increments when
+// WithSpatialIndex is enabled.
+func (r *Renderer) IndexFallbacks() int {
+	r.indexMu.Lock()
+	defer r.indexMu.Unlock()
+	return r.indexFallbacks
 }
 
 // Stats returns the current render statistics.

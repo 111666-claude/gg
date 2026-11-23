@@ -478,3 +478,108 @@ func BenchmarkScenePool_GetPut(b *testing.B) {
 		pool.Put(scene)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Spatial Index Benchmarks
+// ---------------------------------------------------------------------------
+
+// buildLargeSparseScene creates 10000 small primitives spread over a large
+// canvas so each tile sees only a handful of them.
+func buildLargeSparseScene() *Scene {
+	s := NewScene()
+	for j := 0; j < 10000; j++ {
+		x := float32(j%100) * 40
+		y := float32(j/100) * 40
+		s.Fill(FillNonZero, IdentityAffine(),
+			SolidBrush(gg.RGBA{R: float64(j%3) * 0.3, G: 0.2, B: 0.1, A: 1}),
+			NewRectShape(x, y, 12, 12))
+	}
+	return s
+}
+
+// BenchmarkCommandIndex_Query measures a tile-sized query on a large scene.
+func BenchmarkCommandIndex_Query(b *testing.B) {
+	s := buildLargeSparseScene()
+	idx := s.BuildCommandIndex()
+	if idx == nil {
+		b.Fatal("BuildCommandIndex returned nil")
+	}
+	rect := Rect{MinX: 640, MinY: 640, MaxX: 704, MaxY: 704}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		refs := idx.Query(rect)
+		if len(refs) == 0 {
+			b.Fatal("expected visible commands")
+		}
+	}
+}
+
+// BenchmarkCommandIndex_QueryAppend measures the allocation-free query path
+// used by the renderer.
+func BenchmarkCommandIndex_QueryAppend(b *testing.B) {
+	s := buildLargeSparseScene()
+	idx := s.BuildCommandIndex()
+	if idx == nil {
+		b.Fatal("BuildCommandIndex returned nil")
+	}
+	rect := Rect{MinX: 640, MinY: 640, MaxX: 704, MaxY: 704}
+	buf := make([]CommandRef, 0, 64)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf = idx.QueryAppend(buf[:0], rect)
+	}
+}
+
+// BenchmarkCommandIndex_Build measures index construction over 10000 commands.
+func BenchmarkCommandIndex_Build(b *testing.B) {
+	s := buildLargeSparseScene()
+	enc := s.Encoding()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if idx := BuildCommandIndex(enc); idx == nil {
+			b.Fatal("BuildCommandIndex returned nil")
+		}
+	}
+}
+
+// BenchmarkSpatialIndex_SingleTileRender compares per-tile command replay with
+// and without the index. One 64x64 tile is dirty; the index should touch only
+// the handful of primitives that overlap it.
+func BenchmarkSpatialIndex_SingleTileRender(b *testing.B) {
+	for _, withIndex := range []bool{false, true} {
+		name := "FullScan"
+		if withIndex {
+			name = "Indexed"
+		}
+		b.Run(name, func(b *testing.B) {
+			var opts []RendererOption
+			if withIndex {
+				opts = append(opts, WithSpatialIndex())
+			}
+			r := NewRenderer(4000, 4000, opts...)
+			if r == nil {
+				b.Fatal("NewRenderer returned nil")
+			}
+			defer r.Close()
+
+			target := gg.NewPixmap(4000, 4000)
+			s := buildLargeSparseScene()
+			_ = r.Render(target, s) // warm the index
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				r.MarkDirty(640, 640, 64, 64)
+				if err := r.RenderDirty(target, s, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
