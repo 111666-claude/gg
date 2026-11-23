@@ -43,8 +43,13 @@ type Surface interface {
 	// The path is not modified or consumed.
 	Stroke(path *Path, style StrokeStyle)
 
-	// DrawImage draws an image at the specified position.
+	// DrawImage draws an image onto the surface.
 	// If opts is nil, default options are used.
+	//
+	// The source rectangle is mapped onto the destination rectangle, scaling
+	// and filtering as requested by opts.Filter. A negative destination width
+	// or height mirrors the image along that axis. Out-of-bounds and oversized
+	// rectangles are clipped safely to the surface.
 	DrawImage(img image.Image, at Point, opts *DrawImageOptions)
 
 	// Flush ensures all pending drawing operations are complete.

@@ -183,17 +183,31 @@ func (s StrokeStyle) IsDashed() bool {
 type DrawImageOptions struct {
 	// SrcRect is the source rectangle within the image.
 	// If nil, the entire image is used.
+	// The rectangle is canonicalized and clipped to the image bounds;
+	// fully out-of-bounds rectangles draw nothing.
 	SrcRect *image.Rectangle
 
 	// DstRect is the destination rectangle on the surface.
 	// If nil, the image is drawn at At with its original size.
+	//
+	// The source rectangle is mapped onto DstRect, scaling or shrinking as
+	// needed. A negative width or height mirrors the image along that axis,
+	// which allows flipped thumbnails without a separate transform. The
+	// destination is clipped to the surface; it is never used to size an
+	// allocation.
 	DstRect *image.Rectangle
 
 	// Alpha is the opacity (0.0 = transparent, 1.0 = opaque).
-	// Default: 1.0
+	// Values outside [0, 1] are clamped.
+	//
+	// Note: the zero value means fully transparent, preserving the behavior of
+	// ImageSurface.DrawImage before scaling support was added. Use
+	// DefaultDrawImageOptions (Alpha = 1) or set Alpha explicitly when a
+	// visible draw is intended.
 	Alpha float64
 
 	// Filter is the interpolation mode for scaling.
+	// The zero value (FilterNearest) reproduces a 1:1 blit exactly.
 	Filter Filter
 }
 
@@ -210,11 +224,31 @@ type Filter uint8
 
 const (
 	// FilterNearest uses nearest-neighbor interpolation.
+	// It is the default and reproduces a 1:1 blit exactly.
 	FilterNearest Filter = iota
 
-	// FilterBilinear uses bilinear interpolation.
+	// FilterBilinear uses bilinear interpolation over the 2x2 neighborhood.
+	// Smooths scaled thumbnails while keeping edges crisp.
 	FilterBilinear
+
+	// FilterBicubic uses Catmull-Rom bicubic interpolation over the 4x4
+	// neighborhood. Highest quality, best for upscaling photographs.
+	FilterBicubic
 )
+
+// String returns a human-readable name for the filter.
+func (f Filter) String() string {
+	switch f {
+	case FilterNearest:
+		return "Nearest"
+	case FilterBilinear:
+		return "Bilinear"
+	case FilterBicubic:
+		return "Bicubic"
+	default:
+		return "Unknown"
+	}
+}
 
 // Pattern is a color source that can vary across the surface.
 // Used for gradients and image patterns.

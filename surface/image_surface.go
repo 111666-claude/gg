@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 
 	"github.com/gogpu/gg/internal/raster"
 )
@@ -175,45 +176,530 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 	})
 }
 
-// DrawImage draws an image at the specified position.
+// DrawImage draws an image onto the surface.
+//
+// The source rectangle (opts.SrcRect, defaulting to the image's full bounds)
+// is mapped onto the destination rectangle (opts.DstRect, defaulting to a
+// rectangle of the source's size anchored at at). When the rectangles differ
+// in size the image is scaled with opts.Filter.
+//
+// A negative width or height in DstRect mirrors the image along that axis,
+// so flipped thumbnails and previews can be produced without a transform.
+//
+// Sampling is performed in premultiplied alpha space, then converted back to
+// straight alpha and composited with the existing source-over rules. This
+// avoids dark fringes around transparent edges. opts.Alpha is applied to the
+// sampled alpha before compositing.
+//
+// The destination is clipped to the surface bounds and the source rectangle
+// is clipped to the image bounds, so partially visible or oversized draws are
+// safe and never allocate based on the destination size. Calls that replicate
+// the previous 1:1 nearest-neighbor behavior produce bit-identical results.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
 	if s.closed || img == nil {
 		return
 	}
 
-	srcBounds := img.Bounds()
-	if opts != nil && opts.SrcRect != nil {
-		srcBounds = *opts.SrcRect
+	imgBounds := img.Bounds()
+	if imgBounds.Empty() {
+		return
 	}
 
-	dstX := int(at.X)
-	dstY := int(at.Y)
-
-	alpha := 1.0
-	if opts != nil {
-		alpha = opts.Alpha
+	srcRect, dstRect, dstGiven, filter := resolveDrawImageOptions(opts, imgBounds)
+	alpha, ok := resolveDrawImageAlpha(opts)
+	if !ok {
+		return
 	}
 
-	// Simple nearest-neighbor blit for now
-	for sy := srcBounds.Min.Y; sy < srcBounds.Max.Y; sy++ {
-		dy := dstY + (sy - srcBounds.Min.Y)
-		if dy < 0 || dy >= s.height {
+	// Signed source span. A negative span mirrors source sampling.
+	srcSpanW := float64(srcRect.Max.X) - float64(srcRect.Min.X)
+	srcSpanH := float64(srcRect.Max.Y) - float64(srcRect.Min.Y)
+	if srcSpanW == 0 || srcSpanH == 0 {
+		return
+	}
+
+	// Resolve the destination origin and signed span.
+	var (
+		dstX, dstY         int
+		dstSpanW, dstSpanH float64
+	)
+	if dstGiven {
+		dstX, dstY = dstRect.Min.X, dstRect.Min.Y
+		dstSpanW = float64(dstRect.Max.X) - float64(dstRect.Min.X)
+		dstSpanH = float64(dstRect.Max.Y) - float64(dstRect.Min.Y)
+	} else {
+		// Preserve the historical truncation of the anchor position.
+		if !isFiniteCoord(at.X) || !isFiniteCoord(at.Y) {
+			return
+		}
+		dstX, dstY = int(at.X), int(at.Y)
+		dstSpanW, dstSpanH = srcSpanW, srcSpanH
+	}
+
+	if dstSpanW == 0 || dstSpanH == 0 || !isFiniteCoord(dstSpanW) || !isFiniteCoord(dstSpanH) {
+		return
+	}
+
+	// Fast path: unmirrored 1:1 blit. All filters are mathematically the
+	// identity at exact pixel centers, so taking the historical loop here
+	// guarantees that equal-size calls remain pixel-identical after the
+	// scaling work was introduced (including its exact alpha handling).
+	if dstSpanW == srcSpanW && dstSpanH == srcSpanH &&
+		dstSpanW > 0 && dstSpanH > 0 {
+		s.drawImageBlit(img, srcRect, dstX, dstY, alpha)
+		return
+	}
+
+	s.drawImageScaled(img, srcRect, dstX, dstY, dstSpanW, dstSpanH, filter, alpha)
+}
+
+// resolveDrawImageOptions returns the effective source and destination
+// rectangles plus the filter. dstGiven reports whether the caller supplied a
+// destination rectangle.
+func resolveDrawImageOptions(opts *DrawImageOptions, imgBounds image.Rectangle) (
+	srcRect image.Rectangle,
+	dstRect image.Rectangle,
+	dstGiven bool,
+	filter Filter,
+) {
+	srcRect = imgBounds
+	if opts == nil {
+		return srcRect, dstRect, false, FilterNearest
+	}
+	if opts.SrcRect != nil {
+		srcRect = *opts.SrcRect
+	}
+	if opts.DstRect != nil {
+		dstRect = *opts.DstRect
+		dstGiven = true
+	}
+	filter = opts.Filter
+	switch filter {
+	case FilterNearest, FilterBilinear, FilterBicubic:
+	default:
+		filter = FilterNearest
+	}
+	return srcRect, dstRect, dstGiven, filter
+}
+
+// resolveDrawImageAlpha normalizes the requested opacity.
+//
+// The zero value keeps the historical meaning of fully transparent: the
+// pre-scaling implementation multiplied every source pixel by Alpha, so a zero
+// value produced no visible change. Callers that want a visible draw must pass
+// Alpha > 0 (DefaultDrawImageOptions returns 1.0).
+//
+// NaN and +Inf were effectively opaque before (the historical "< 1.0" check was
+// false) and remain so. Negative values and -Inf draw nothing, which is the
+// deterministic reading of the old "multiply by a negative alpha" path.
+func resolveDrawImageAlpha(opts *DrawImageOptions) (float64, bool) {
+	if opts == nil {
+		return 1, true
+	}
+	alpha := opts.Alpha
+	switch {
+	case math.IsNaN(alpha), math.IsInf(alpha, 1):
+		return 1, true
+	case math.IsInf(alpha, -1), alpha <= 0:
+		return 0, false
+	case alpha > 1:
+		return 1, true
+	}
+	return alpha, true
+}
+
+// drawImageBlit is the historical 1:1 nearest-neighbor path. It produces the
+// same pixels as earlier releases, including their alpha handling, but clips
+// the iteration to the surface so an oversized source/destination rectangle
+// cannot drive unbounded work.
+func (s *ImageSurface) drawImageBlit(img image.Image, srcBounds image.Rectangle, dstX, dstY int, alpha float64) {
+	w := int64(srcBounds.Max.X) - int64(srcBounds.Min.X)
+	h := int64(srcBounds.Max.Y) - int64(srcBounds.Min.Y)
+	if w <= 0 || h <= 0 {
+		return
+	}
+
+	dx0, dy0 := int64(dstX), int64(dstY)
+	cx0 := maxInt64(dx0, 0)
+	cx1 := minInt64(dx0+w, int64(s.width))
+	cy0 := maxInt64(dy0, 0)
+	cy1 := minInt64(dy0+h, int64(s.height))
+	if cx0 >= cx1 || cy0 >= cy1 {
+		return
+	}
+
+	imgBounds := img.Bounds()
+	srcMinX := int64(srcBounds.Min.X)
+	srcMinY := int64(srcBounds.Min.Y)
+
+	for dy := cy0; dy < cy1; dy++ {
+		sy64 := srcMinY + (dy - dy0)
+		if sy64 < int64(imgBounds.Min.Y) || sy64 >= int64(imgBounds.Max.Y) {
+			// Outside the image bounds; standard image.Image.At returns a
+			// transparent color there, which is a no-op for source-over.
 			continue
 		}
-
-		for sx := srcBounds.Min.X; sx < srcBounds.Max.X; sx++ {
-			dx := dstX + (sx - srcBounds.Min.X)
-			if dx < 0 || dx >= s.width {
+		sy := int(sy64)
+		for dx := cx0; dx < cx1; dx++ {
+			sx64 := srcMinX + (dx - dx0)
+			if sx64 < int64(imgBounds.Min.X) || sx64 >= int64(imgBounds.Max.X) {
 				continue
 			}
-
-			srcColor := img.At(sx, sy)
+			srcColor := img.At(int(sx64), sy)
 			if alpha < 1.0 {
 				srcColor = s.applyAlpha(srcColor, alpha)
 			}
-			s.blendPixel(dx, dy, srcColor)
+			s.blendPixel(int(dx), int(dy), srcColor)
 		}
 	}
+}
+
+// drawImageScaled maps src onto the destination rectangle, sampling with the
+// requested filter. The source and destination spans are signed: a negative
+// span mirrors sampling/drawing along that axis.
+func (s *ImageSurface) drawImageScaled(
+	img image.Image,
+	src image.Rectangle,
+	dstX, dstY int,
+	dstSpanW, dstSpanH float64,
+	filter Filter,
+	alpha float64,
+) {
+	imgBounds := img.Bounds()
+
+	// Valid source pixel range: requested rectangle ∩ image bounds. Sampling
+	// is clamped to this range so a sub-rectangle never bleeds in unrelated
+	// neighbors and out-of-image coordinates are never read.
+	loX := maxInt(minInt(src.Min.X, src.Max.X), imgBounds.Min.X)
+	hiX := minInt(maxInt(src.Min.X, src.Max.X), imgBounds.Max.X)
+	loY := maxInt(minInt(src.Min.Y, src.Max.Y), imgBounds.Min.Y)
+	hiY := minInt(maxInt(src.Min.Y, src.Max.Y), imgBounds.Max.Y)
+	if loX >= hiX || loY >= hiY {
+		return
+	}
+
+	x0, x1, ok := visibleRange(dstX, dstSpanW, s.width)
+	if !ok {
+		return
+	}
+	y0, y1, ok := visibleRange(dstY, dstSpanH, s.height)
+	if !ok {
+		return
+	}
+
+	srcSpanW := float64(src.Max.X) - float64(src.Min.X)
+	srcSpanH := float64(src.Max.Y) - float64(src.Min.Y)
+	srcX0 := float64(src.Min.X)
+	srcY0 := float64(src.Min.Y)
+
+	// Cache the x mapping for the clipped column range.
+	cols := x1 - x0
+	srcXs := make([]float64, cols)
+	validX := make([]bool, cols)
+	for i := range cols {
+		dx := x0 + i
+		t := (float64(dx) + 0.5 - float64(dstX)) / dstSpanW
+		if t < 0 || t >= 1 {
+			continue
+		}
+		sx := srcX0 + t*srcSpanW
+		// The epsilon admits the final texel so nearest sampling can honor
+		// exact source edges despite floating-point rounding.
+		if sx < float64(loX) || sx >= float64(hiX)+sourceEdgeEpsilon {
+			continue
+		}
+		srcXs[i] = sx
+		validX[i] = true
+	}
+
+	for dy := y0; dy < y1; dy++ {
+		t := (float64(dy) + 0.5 - float64(dstY)) / dstSpanH
+		if t < 0 || t >= 1 {
+			continue
+		}
+		sy := srcY0 + t*srcSpanH
+		if sy < float64(loY) || sy >= float64(hiY)+sourceEdgeEpsilon || math.IsNaN(sy) {
+			continue
+		}
+
+		for i := range cols {
+			if !validX[i] {
+				continue
+			}
+			pr, pg, pb, pa := samplePremul(img, srcXs[i], sy, filter, loX, hiX, loY, hiY)
+			c := unpremultiply(pr, pg, pb, pa, alpha)
+			if c.A == 0 {
+				continue
+			}
+			s.blendPixelAlpha(x0+i, dy, c, 255)
+		}
+	}
+}
+
+// samplePremul returns the filtered color in premultiplied 8-bit space.
+func samplePremul(img image.Image, sx, sy float64, filter Filter, loX, hiX, loY, hiY int) (r, g, b, a float64) {
+	switch filter {
+	case FilterBilinear:
+		return sampleBilinearPremul(img, sx, sy, loX, hiX, loY, hiY)
+	case FilterBicubic:
+		return sampleBicubicPremul(img, sx, sy, loX, hiX, loY, hiY)
+	default:
+		return sampleNearestPremul(img, sx, sy, loX, hiX, loY, hiY)
+	}
+}
+
+// sampleNearestPremul selects the pixel containing (sx, sy).
+func sampleNearestPremul(img image.Image, sx, sy float64, loX, hiX, loY, hiY int) (r, g, b, a float64) {
+	x := clampInt(int(math.Floor(sx)), loX, hiX-1)
+	y := clampInt(int(math.Floor(sy)), loY, hiY-1)
+	return premulAt(img, x, y)
+}
+
+// sampleBilinearPremul performs bilinear filtering in premultiplied space.
+func sampleBilinearPremul(img image.Image, sx, sy float64, loX, hiX, loY, hiY int) (r, g, b, a float64) {
+	fx := sx - 0.5
+	fy := sy - 0.5
+	x0f := math.Floor(fx)
+	y0f := math.Floor(fy)
+	tx := fx - x0f
+	ty := fy - y0f
+	x0 := clampInt(int(x0f), loX, hiX-1)
+	x1 := clampInt(int(x0f)+1, loX, hiX-1)
+	y0 := clampInt(int(y0f), loY, hiY-1)
+	y1 := clampInt(int(y0f)+1, loY, hiY-1)
+
+	r00, g00, b00, a00 := premulAt(img, x0, y0)
+	r10, g10, b10, a10 := premulAt(img, x1, y0)
+	r01, g01, b01, a01 := premulAt(img, x0, y1)
+	r11, g11, b11, a11 := premulAt(img, x1, y1)
+
+	r = lerp2D(r00, r10, r01, r11, tx, ty)
+	g = lerp2D(g00, g10, g01, g11, tx, ty)
+	b = lerp2D(b00, b10, b01, b11, tx, ty)
+	a = lerp2D(a00, a10, a01, a11, tx, ty)
+	return r, g, b, a
+}
+
+// sampleBicubicPremul performs Catmull-Rom bicubic filtering in premultiplied space.
+func sampleBicubicPremul(img image.Image, sx, sy float64, loX, hiX, loY, hiY int) (r, g, b, a float64) {
+	fx := sx - 0.5
+	fy := sy - 0.5
+	xi := int(math.Floor(fx))
+	yi := int(math.Floor(fy))
+	tx := fx - float64(xi)
+	ty := fy - float64(yi)
+
+	wx := [4]float64{
+		cubicWeight(tx + 1),
+		cubicWeight(tx),
+		cubicWeight(tx - 1),
+		cubicWeight(tx - 2),
+	}
+	wy := [4]float64{
+		cubicWeight(ty + 1),
+		cubicWeight(ty),
+		cubicWeight(ty - 1),
+		cubicWeight(ty - 2),
+	}
+
+	for j := -1; j <= 2; j++ {
+		py := clampInt(yi+j, loY, hiY-1)
+		for i := -1; i <= 2; i++ {
+			px := clampInt(xi+i, loX, hiX-1)
+			cr, cg, cb, ca := premulAt(img, px, py)
+			w := wx[i+1] * wy[j+1]
+			r += cr * w
+			g += cg * w
+			b += cb * w
+			a += ca * w
+		}
+	}
+	return r, g, b, a
+}
+
+// premulAt returns the premultiplied 8-bit color of a pixel.
+//
+// Per the image package contract, *image.RGBA bytes are already
+// premultiplied and *image.NRGBA bytes are straight, so the latter is
+// premultiplied here. Other types go through color.Color.RGBA, which also
+// yields premultiplied channels.
+func premulAt(img image.Image, x, y int) (r, g, b, a float64) {
+	switch im := img.(type) {
+	case *image.RGBA:
+		i := im.PixOffset(x, y)
+		return float64(im.Pix[i+0]), float64(im.Pix[i+1]), float64(im.Pix[i+2]), float64(im.Pix[i+3])
+	case *image.NRGBA:
+		i := im.PixOffset(x, y)
+		return straightToPremul(im.Pix[i+0], im.Pix[i+1], im.Pix[i+2], im.Pix[i+3])
+	case *image.Gray:
+		i := im.PixOffset(x, y)
+		v := float64(im.Pix[i])
+		return v, v, v, 255
+	default:
+		cr, cg, cb, ca := img.At(x, y).RGBA()
+		// RGBA() returns 16-bit premultiplied channels.
+		//nolint:gosec // G115: shifting a uint32 right by 8 fits uint8
+		return float64(uint8(cr >> 8)), float64(uint8(cg >> 8)), float64(uint8(cb >> 8)), float64(uint8(ca >> 8))
+	}
+}
+
+// straightToPremul converts straight 8-bit channels to premultiplied floats.
+func straightToPremul(r, g, b, a uint8) (pr, pg, pb, pa float64) {
+	if a == 0 {
+		return 0, 0, 0, 0
+	}
+	af := float64(a)
+	return float64(r) * af / 255.0, float64(g) * af / 255.0, float64(b) * af / 255.0, af
+}
+
+// unpremultiply converts a filtered premultiplied color back to straight
+// 8-bit RGBA and applies opacity to the alpha channel.
+//
+// Catmull-Rom filtering can overshoot at sharp edges, producing premultiplied
+// channels above the filtered alpha. They are clamped to [0, alpha] first so
+// the recovered straight color is valid (no channel exceeds 255, no halo).
+func unpremultiply(pr, pg, pb, pa, opacity float64) color.RGBA {
+	pa = clampChannel(pa)
+	if pa <= 0 {
+		return color.RGBA{}
+	}
+	r := clampChannel(pr)
+	g := clampChannel(pg)
+	b := clampChannel(pb)
+	// A premultiplied channel can never exceed its alpha.
+	r = math.Min(r, pa)
+	g = math.Min(g, pa)
+	b = math.Min(b, pa)
+	inv := 255.0 / pa
+	r = clampChannel(r * inv)
+	g = clampChannel(g * inv)
+	b = clampChannel(b * inv)
+	a := pa
+	if opacity < 1 {
+		// Truncate like the historical applyAlpha/rescale path.
+		a = float64(uint8(clampChannel(a * opacity)))
+	}
+	//nolint:gosec // G115: values are clamped to [0, 255]
+	return color.RGBA{
+		R: uint8(math.Round(r)),
+		G: uint8(math.Round(g)),
+		B: uint8(math.Round(b)),
+		A: uint8(math.Round(a)),
+	}
+}
+
+// lerp2D performs bilinear interpolation on a 2x2 grid.
+func lerp2D(v00, v10, v01, v11, tx, ty float64) float64 {
+	v0 := v00 + (v10-v00)*tx
+	v1 := v01 + (v11-v01)*tx
+	return v0 + (v1-v0)*ty
+}
+
+// cubicWeight computes the Catmull-Rom cubic weight for distance t.
+func cubicWeight(t float64) float64 {
+	absT := math.Abs(t)
+	if absT < 1 {
+		return 1.5*absT*absT*absT - 2.5*absT*absT + 1.0
+	}
+	if absT < 2 {
+		return -0.5*absT*absT*absT + 2.5*absT*absT - 4.0*absT + 2.0
+	}
+	return 0
+}
+
+// visibleRange returns the surface pixel indices that may intersect the
+// signed destination span [min, min+span). The result is clipped to
+// [0, limit), so oversized destinations never drive unbounded work.
+func visibleRange(origin int, span float64, limit int) (int, int, bool) {
+	if span == 0 || math.IsNaN(span) || math.IsInf(span, 0) {
+		return 0, 0, false
+	}
+	a := float64(origin)
+	b := a + span
+	lo := math.Min(a, b)
+	hi := math.Max(a, b)
+	if hi <= 0 || lo >= float64(limit) {
+		return 0, 0, false
+	}
+	lo = math.Max(lo, 0)
+	hi = math.Min(hi, float64(limit))
+	if lo >= hi {
+		return 0, 0, false
+	}
+	// Clamp in float space before converting so out-of-range spans cannot
+	// overflow int on 32-bit platforms.
+	x0 := int(math.Floor(lo))
+	x1 := int(math.Ceil(hi))
+	if x0 < 0 {
+		x0 = 0
+	}
+	if x1 > limit {
+		x1 = limit
+	}
+	if x0 >= x1 {
+		return 0, 0, false
+	}
+	return x0, x1, true
+}
+
+// isFiniteCoord reports whether v can be safely converted to int.
+func isFiniteCoord(v float64) bool {
+	const maxCoord = float64(1 << 62)
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= -maxCoord && v <= maxCoord
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// sourceEdgeEpsilon tolerates floating-point round-off when comparing a
+// mapped source coordinate with the exclusive upper edge of the source rect.
+const sourceEdgeEpsilon = 1e-9
+
+// clampChannel clamps a channel value to the 8-bit range, treating NaN and
+// negative values as zero.
+func clampChannel(v float64) float64 {
+	if math.IsNaN(v) || v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // Flush ensures all pending operations are complete.
@@ -605,5 +1091,7 @@ func sqrtf32(x float32) float32 {
 }
 
 // Verify ImageSurface implements Surface interface.
-var _ Surface = (*ImageSurface)(nil)
-var _ CapableSurface = (*ImageSurface)(nil)
+var (
+	_ Surface        = (*ImageSurface)(nil)
+	_ CapableSurface = (*ImageSurface)(nil)
+)

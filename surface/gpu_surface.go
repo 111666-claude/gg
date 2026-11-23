@@ -124,7 +124,9 @@ func (s *GPUSurface) Stroke(path *Path, style StrokeStyle) {
 	s.backend.Stroke(path, style)
 }
 
-// DrawImage draws an image at the specified position.
+// DrawImage draws an image onto the surface. The backend is responsible for
+// honoring SrcRect/DstRect, Filter and Alpha; see ImageSurface.DrawImage for
+// the reference semantics.
 func (s *GPUSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
 	if s.closed || s.backend == nil || img == nil {
 		return
