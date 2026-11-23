@@ -122,132 +122,50 @@ const (
 // findBreakOpportunities analyzes text and returns break opportunities.
 // Returns a slice where index i indicates break opportunity BEFORE character i.
 // The first element (index 0) is always BreakNo (can't break before first char).
+//
+// All modes share the same UAX #14 rule engine (see linebreak.go); the wrap
+// mode only filters the resulting grapheme-safe opportunities.
 func findBreakOpportunities(text string, mode WrapMode) []BreakOpportunity {
 	if text == "" {
 		return nil
 	}
+	return breakOpportunitiesForMode([]rune(text), mode)
+}
 
-	runes := []rune(text)
+// breakOpportunitiesForMode computes break opportunities for runes under the
+// given wrap mode, reusing the shared UAX #14 engine.
+func breakOpportunitiesForMode(runes []rune, mode WrapMode) []BreakOpportunity {
 	n := len(runes)
-	breaks := make([]BreakOpportunity, n)
-
-	// First character cannot have a break before it
-	breaks[0] = BreakNo
+	if n == 0 {
+		return nil
+	}
 
 	if mode == WrapNone {
 		// No breaks allowed
-		return breaks
+		return make([]BreakOpportunity, n)
 	}
 
-	// Classify all runes
-	classes := make([]BreakClass, n)
-	for i, r := range runes {
-		classes[i] = classifyRune(r)
-	}
+	breaks := computeLineBreaks(runes)
 
-	// Apply break rules based on mode
-	for i := 1; i < n; i++ {
-		breaks[i] = computeBreak(runes, classes, i, mode)
-	}
-
-	return breaks
-}
-
-// computeBreak determines the break opportunity before position i.
-func computeBreak(runes []rune, classes []BreakClass, i int, mode WrapMode) BreakOpportunity {
-	if i <= 0 || i >= len(runes) {
-		return BreakNo
-	}
-
-	prevRune := runes[i-1]
-	currRune := runes[i]
-	prevClass := classes[i-1]
-	currClass := classes[i]
-
-	// Mandatory breaks (newlines are handled at paragraph level)
-	if prevRune == '\n' {
-		return BreakMandatory
-	}
-
-	// No break before closing punctuation
-	if currClass == breakClose {
-		return BreakNo
-	}
-
-	// No break after opening punctuation
-	if prevClass == breakOpen {
-		return BreakNo
-	}
-
-	// Break after zero-width space
-	if prevClass == breakZero {
-		return BreakAllowed
-	}
-
-	// Mode-specific rules
-	switch mode {
-	case WrapChar:
-		// Character mode: break anywhere except special cases
-		return BreakAllowed
-
-	case WrapWord:
-		// Word mode: break only at word boundaries
-		return computeWordBreak(prevRune, currRune, prevClass, currClass)
-
-	case WrapWordChar:
-		// WordChar mode: same as Word, but Char is allowed as fallback
-		// The fallback is handled at the wrapping level, not here
-		return computeWordBreak(prevRune, currRune, prevClass, currClass)
-
-	default:
-		return BreakNo
-	}
-}
-
-// computeWordBreak determines break opportunity for word-based wrapping.
-func computeWordBreak(prevRune, currRune rune, prevClass, currClass BreakClass) BreakOpportunity {
-	// Break after space
-	if prevClass == breakSpace {
-		return BreakAllowed
-	}
-
-	// Break after hyphens (but not before)
-	if prevClass == breakHyphen && currClass != breakHyphen {
-		return BreakAllowed
-	}
-
-	// CJK: break before and after ideographs
-	if currClass == breakIdeographic {
-		return BreakAllowed
-	}
-	if prevClass == breakIdeographic && currClass != breakClose {
-		return BreakAllowed
-	}
-
-	// Break at transitions between categories
-	if isBreakBetweenCategories(prevRune, currRune) {
-		return BreakAllowed
-	}
-
-	return BreakNo
-}
-
-// isBreakBetweenCategories checks for breaks between different character categories.
-func isBreakBetweenCategories(prev, curr rune) bool {
-	// Break before punctuation after letters/digits
-	if (unicode.IsLetter(prev) || unicode.IsDigit(prev)) && unicode.IsPunct(curr) {
-		// But not for apostrophes, periods in numbers, etc.
-		if curr != '\'' && curr != '.' && curr != ',' {
-			return true
+	if mode == WrapChar {
+		// Character mode: allow a break at every grapheme cluster boundary
+		// (never inside a cluster), keeping mandatory breaks from UAX #14.
+		clusters := graphemeBreaks(runes)
+		for i := 1; i < n; i++ {
+			if breaks[i] == BreakMandatory {
+				continue
+			}
+			if clusters[i] {
+				breaks[i] = BreakAllowed
+			} else {
+				breaks[i] = BreakNo
+			}
 		}
 	}
 
-	// Break after punctuation before letters (except apostrophe)
-	if unicode.IsPunct(prev) && prev != '\'' && unicode.IsLetter(curr) {
-		return true
-	}
-
-	return false
+	// WrapWord and WrapWordChar use the UAX #14 opportunities directly;
+	// the WordChar character fallback is applied at the wrapping level.
+	return breaks
 }
 
 // wrapTextInfo contains information for line wrapping decisions.
@@ -258,6 +176,8 @@ type wrapTextInfo struct {
 	runes []rune
 	// Break opportunities (index i = break before rune i)
 	breaks []BreakOpportunity
+	// Grapheme cluster boundaries (index i = cluster starts before rune i)
+	clusters []bool
 	// Byte offsets for each rune
 	byteOffsets []int
 	// Wrap mode
@@ -281,7 +201,8 @@ func newWrapTextInfo(text string, mode WrapMode) *wrapTextInfo {
 	return &wrapTextInfo{
 		text:        text,
 		runes:       runes,
-		breaks:      findBreakOpportunities(text, mode),
+		breaks:      breakOpportunitiesForMode(runes, mode),
+		clusters:    graphemeBreaks(runes),
 		byteOffsets: offsets,
 		mode:        mode,
 	}
@@ -497,8 +418,9 @@ func calculateLineBreakPosition(w *wrapTextInfo, pos, lineStart, lastBreakPoint 
 
 	switch mode {
 	case WrapWordChar, WrapChar:
-		// Fall back to character break
-		return pos
+		// Fall back to character break, snapped to a grapheme cluster
+		// boundary so emoji sequences and combining marks stay intact.
+		return snapToGraphemeBoundary(w, pos, lineStart)
 	case WrapWord:
 		// Allow overflow until we find a break point
 		for j := pos; j < len(w.runes); j++ {
@@ -510,6 +432,36 @@ func calculateLineBreakPosition(w *wrapTextInfo, pos, lineStart, lastBreakPoint 
 	default:
 		return pos
 	}
+}
+
+// snapToGraphemeBoundary returns a grapheme-safe break position for the
+// character-level fallback: the last cluster boundary at or before pos,
+// or — when a single cluster already overflows the line — the first
+// cluster boundary after lineStart so wrapping always makes progress
+// without splitting a visual character.
+func snapToGraphemeBoundary(w *wrapTextInfo, pos, lineStart int) int {
+	limit := pos
+	if limit > len(w.runes) {
+		limit = len(w.runes)
+	}
+
+	best := -1
+	for i := lineStart + 1; i <= limit; i++ {
+		if i == len(w.runes) || w.clusters[i] {
+			best = i
+		}
+	}
+	if best > lineStart {
+		return best
+	}
+
+	// No boundary fits on this line: take the next cluster boundary.
+	for i := lineStart + 1; i < len(w.runes); i++ {
+		if w.clusters[i] {
+			return i
+		}
+	}
+	return len(w.runes)
 }
 
 // measureRune measures the advance width of a single rune.
