@@ -867,6 +867,25 @@ User Code → Recorder → Commands → Recording → Backend → Output
 | **PDF** | `github.com/gogpu/gg-pdf` | PDF documents |
 | **SVG** | `github.com/gogpu/gg-svg` | SVG vector graphics |
 
+### Capability Negotiation
+
+A backend may implement `recording.CapabilityBackend` to declare the commands
+it executes natively (`Native`) and equivalent substitutions it accepts
+(`Fallbacks`). `Recording.Preflight` returns a `CapabilityReport` naming every
+missing capability with the command indexes that need it. Playback then applies
+one of three policies:
+
+| Policy | Behavior |
+|--------|----------|
+| `PolicyStrict` (default) | Fail before `Begin`; no partial output |
+| `PolicySkip` | Skip unsupported commands, keep order and state stack, report them |
+| `PolicyDegrade` | Rewrite to an equivalent command (exact geometry, not an approximation) |
+
+Built-in equivalent rewrites: `FillRect`→`FillPath`, `StrokeRect`→`StrokePath`,
+`ClipRoundRect`→`ClipPath`, and style commands→no-op (their effect travels with
+the drawing command). A backend that does not implement `CapabilityBackend` is
+assumed to support everything, preserving the pre-capability behavior.
+
 ## Relationship to gogpu Ecosystem
 
 ```

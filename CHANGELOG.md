@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Recording capability negotiation and playback policies** — a backend can
+  implement `recording.CapabilityBackend` to declare which commands it executes
+  natively (`FillPath`, `StrokePath`, `FillRect`, `StrokeRect`, `DrawImage`,
+  `DrawText`, `StrokeText`, clips, and each style command). `Recording.Preflight`
+  returns a `CapabilityReport` listing every missing capability with the
+  zero-based command indexes that need it, before any output is produced.
+  `Playback` keeps the existing strict behavior; `PlaybackWithOptions` adds
+  `PolicySkip` (skip and report unsupported commands, keeping command order and
+  the state stack intact) and `PolicyDegrade` (rewrite to an equivalent simpler
+  command: `FillRect` → `FillPath`, `StrokeRect` → `StrokePath`,
+  `ClipRoundRect` → `ClipPath`, style commands → no-op). A nil backend, unknown
+  command, contradictory capability declaration, fallback cycle, or missing
+  resource returns a `PlaybackError` carrying the command number. Backends that
+  do not declare capabilities are unchanged.
+- **The raster backend renders images** — `recording/backends/raster` used to
+  draw only an empty rectangle for `DrawImage`, so an image produced no pixels.
+  It now draws the source rectangle through `gg.Context.DrawImageEx`, honoring
+  the destination rect, interpolation mode and alpha, and declares its
+  capability set (including `DrawImage`, excluding `StrokeText`).
 - **`SetAcceleratorMaxSampleCount`**: caps the MSAA sample count of the GPU
   accelerator. `1` turns multi-sampling off (`strategyNoMSAA`, the path
   software adapters already take), and `0` restores the default. The optional

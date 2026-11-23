@@ -70,11 +70,30 @@ type Backend struct {
 
 // Ensure Backend implements all required interfaces.
 var (
-	_ recording.Backend       = (*Backend)(nil)
-	_ recording.WriterBackend = (*Backend)(nil)
-	_ recording.FileBackend   = (*Backend)(nil)
-	_ recording.PixmapBackend = (*Backend)(nil)
+	_ recording.Backend           = (*Backend)(nil)
+	_ recording.CapabilityBackend = (*Backend)(nil)
+	_ recording.WriterBackend     = (*Backend)(nil)
+	_ recording.FileBackend       = (*Backend)(nil)
+	_ recording.PixmapBackend     = (*Backend)(nil)
 )
+
+// rasterCapabilities is what the raster backend executes natively.
+//
+// Stroked text is not listed: the Backend interface has no stroke-text
+// operation, so a StrokeText command cannot be rendered as an outline here.
+// Images are rendered through gg.Context.DrawImageEx.
+var rasterCapabilities = recording.CapabilitySet{
+	Native: recording.CapFillPath | recording.CapStrokePath |
+		recording.CapFillRect | recording.CapStrokeRect |
+		recording.CapDrawImage | recording.CapDrawText |
+		recording.CapClipPath | recording.CapClipRoundRect |
+		recording.CapClearClip | recording.CapStyles,
+}
+
+// BackendCapabilities implements recording.CapabilityBackend.
+func (b *Backend) BackendCapabilities() recording.CapabilitySet {
+	return rasterCapabilities
+}
 
 // NewBackend creates a new raster backend at 1x scale.
 // The backend must be initialized with Begin before use.
@@ -204,45 +223,47 @@ func (b *Backend) FillRect(rect recording.Rect, brush recording.Brush) {
 }
 
 // DrawImage draws an image from source to destination rectangle.
-func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, _ recording.ImageOptions) {
-	if img == nil {
+// The recording rects are in world space; the current CTM maps them to device
+// pixels, matching how DrawImageEx positions its destination rectangle.
+func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, opts recording.ImageOptions) {
+	if img == nil || dst.IsEmpty() {
 		return
 	}
 
-	// Save current state
-	b.ctx.Push()
-	defer b.ctx.Pop()
-
-	// Calculate scale
-	srcW := src.Width()
-	srcH := src.Height()
-	dstW := dst.Width()
-	dstH := dst.Height()
-
-	if srcW == 0 || srcH == 0 {
-		// Use full image bounds
-		bounds := img.Bounds()
-		srcW = float64(bounds.Dx())
-		srcH = float64(bounds.Dy())
+	buf := gg.ImageBufFromImage(img)
+	if buf == nil {
+		return
 	}
 
-	scaleX := dstW / srcW
-	scaleY := dstH / srcH
-
-	// Apply transform for scaling and positioning
-	b.ctx.Translate(dst.MinX, dst.MinY)
-	b.ctx.Scale(scaleX, scaleY)
-	b.ctx.Translate(-src.MinX, -src.MinY)
-
-	// Draw the image at origin (transform handles positioning)
-	// Note: gg.Context.DrawImage takes int coordinates
-	// We need to handle the source rect cropping if specified
-	// For now, draw the full image and let the transform handle it
+	// Source rectangle defaults to the full image when empty.
+	srcRect := image.Rect(
+		int(src.MinX), int(src.MinY),
+		int(src.MaxX), int(src.MaxY),
+	)
 	bounds := img.Bounds()
-	b.ctx.DrawRectangle(float64(bounds.Min.X), float64(bounds.Min.Y),
-		float64(bounds.Dx()), float64(bounds.Dy()))
-	// TODO: Implement proper image drawing with cropping
-	// For now, use a simple approach
+	if src.Width() <= 0 || src.Height() <= 0 {
+		srcRect = bounds
+	}
+
+	opacity := opts.Alpha
+	if opacity <= 0 {
+		opacity = 1
+	}
+	interpolation := gg.InterpBilinear
+	if opts.Interpolation == recording.InterpolationNearest {
+		interpolation = gg.InterpNearest
+	}
+
+	b.ctx.DrawImageEx(buf, gg.DrawImageOptions{
+		X:             dst.MinX,
+		Y:             dst.MinY,
+		DstWidth:      dst.Width(),
+		DstHeight:     dst.Height(),
+		SrcRect:       &srcRect,
+		Interpolation: interpolation,
+		Opacity:       opacity,
+		BlendMode:     gg.BlendNormal,
+	})
 }
 
 // DrawText draws text at the given position with the specified font face and brush.

@@ -18,6 +18,19 @@ import (
 // Backends are created via the registry using NewBackend(name) and
 // registered via Register() in their init() functions.
 //
+// # Capability Declaration
+//
+// A backend can implement [CapabilityBackend] to declare which command
+// families it executes natively. Playback then checks the recording against
+// that declaration before calling Begin:
+//
+//   - [PolicyStrict] (the default, and the only behavior for backends that do
+//     not implement [CapabilityBackend]) fails before any output is produced.
+//   - [PolicySkip] skips unsupported commands and reports them in
+//     [PlaybackResult.Skipped].
+//   - [PolicyDegrade] rewrites unsupported commands into equivalent simpler
+//     commands, such as FillRect into FillPath.
+//
 // # Implementation Contract
 //
 // Each backend must:

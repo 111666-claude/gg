@@ -56,6 +56,35 @@
 //	r.Playback(rasterBackend)
 //	rasterBackend.(recording.PixmapBackend).Pixmap() // Get pixel data
 //
+// # Capability Negotiation
+//
+// A backend may implement [CapabilityBackend] to declare which commands it
+// executes natively and which equivalent commands it accepts as substitutes:
+//
+//	func (b *MyBackend) BackendCapabilities() recording.CapabilitySet {
+//	    return recording.CapabilitySet{
+//	        Native: recording.CapFillRect | recording.CapDrawText | recording.CapStyles,
+//	    }
+//	}
+//
+// Backends that do not implement it are assumed to support everything, which is
+// the pre-capability behavior. For a declaring backend, check the recording
+// before producing output:
+//
+//	report, err := r.Preflight(backend)
+//	if err != nil {
+//	    // nil backend, unknown command or contradictory declaration
+//	}
+//	if !report.IsComplete() {
+//	    log.Printf("missing: %s", report) // includes command indexes
+//	}
+//
+// [Recording.Playback] uses [PolicyStrict]: it reports the gaps and produces no
+// output. [Recording.PlaybackWithOptions] can skip unsupported commands
+// ([PolicySkip]) or rewrite them into equivalents ([PolicyDegrade]). Errors
+// carry the command index through [PlaybackError], and every gap is detected
+// before Begin, so a failed playback never leaves partial output behind.
+//
 // # Backend Registration
 //
 // Backends are registered using the database/sql driver pattern. Import a
@@ -134,6 +163,9 @@
 //	    DrawImage(img image.Image, src, dst Rect, opts ImageOptions)
 //	    DrawText(s string, x, y float64, face text.Face, brush Brush)
 //	}
+//
+// Implement [CapabilityBackend] as well to declare what the backend supports;
+// without it the backend is treated as supporting every command.
 //
 // Register custom backends with [Register]:
 //
