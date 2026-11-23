@@ -207,6 +207,9 @@ func TestImageSurfaceCapabilities(t *testing.T) {
 	if !caps.SupportsAntialias {
 		t.Error("ImageSurface should support antialiasing")
 	}
+	if !caps.SupportsClipping {
+		t.Error("ImageSurface should support clipping")
+	}
 }
 
 // TestImageSurfaceImage tests direct image access.

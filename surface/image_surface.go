@@ -40,6 +40,27 @@ type ImageSurface struct {
 
 	// closed tracks if Close has been called
 	closed bool
+
+	// clip is the current clip state (see clip.go).
+	// clip.mask == nil means no clipping; otherwise it is a width*height
+	// coverage mask multiplied into every drawing operation.
+	clip clipState
+
+	// clipStack holds clip states saved by PushClip.
+	clipStack []clipState
+
+	// clipFiller and clipEdgeBuilder rasterize clip paths. They are separate
+	// from the drawing pipeline so SetClip never clobbers fill/stroke state.
+	// Allocated lazily on the first SetClip.
+	clipFiller      *raster.AnalyticFiller
+	clipEdgeBuilder *raster.EdgeBuilder
+
+	// clipMaskBuf is the reusable width*height active-mask buffer.
+	// clipScratch is the reusable width*height rasterization target.
+	// Keeping both allocated bounds clip memory at 2*width*height bytes
+	// plus one buffer per PushClip level with an active clip.
+	clipMaskBuf []uint8
+	clipScratch []uint8
 }
 
 // NewImageSurface creates a new CPU-based surface with the given dimensions.
@@ -87,6 +108,8 @@ func (s *ImageSurface) Height() int {
 }
 
 // Clear fills the entire surface with the given color.
+// Clear is a full-surface reset and is intentionally NOT affected by the
+// current clip region; use Fill with a full-surface path for clipped clears.
 func (s *ImageSurface) Clear(c color.Color) {
 	if s.closed {
 		return
@@ -106,7 +129,7 @@ func (s *ImageSurface) Clear(c color.Color) {
 
 // Fill fills the given path using the specified style.
 func (s *ImageSurface) Fill(path *Path, style FillStyle) {
-	if s.closed || path == nil || path.IsEmpty() {
+	if s.closed || path == nil || path.IsEmpty() || s.clip.empty {
 		return
 	}
 
@@ -143,7 +166,7 @@ func (s *ImageSurface) Fill(path *Path, style FillStyle) {
 
 // Stroke strokes the given path using the specified style.
 func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
-	if s.closed || path == nil || path.IsEmpty() {
+	if s.closed || path == nil || path.IsEmpty() || s.clip.empty {
 		return
 	}
 
@@ -177,7 +200,7 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 
 // DrawImage draws an image at the specified position.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
-	if s.closed || img == nil {
+	if s.closed || img == nil || s.clip.empty {
 		return
 	}
 
@@ -207,11 +230,26 @@ func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptio
 				continue
 			}
 
+			coverage := uint8(255)
+			if s.clip.mask != nil {
+				coverage = s.clip.mask[dy*s.width+dx]
+				if coverage == 0 {
+					continue
+				}
+			}
+
 			srcColor := img.At(sx, sy)
 			if alpha < 1.0 {
 				srcColor = s.applyAlpha(srcColor, alpha)
 			}
-			s.blendPixel(dx, dy, srcColor)
+			r, g, b, a := srcColor.RGBA()
+			//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
+			s.blendPixelAlpha(dx, dy, color.RGBA{
+				R: uint8(r >> 8),
+				G: uint8(g >> 8),
+				B: uint8(b >> 8),
+				A: uint8(a >> 8),
+			}, coverage)
 		}
 	}
 }
@@ -242,6 +280,12 @@ func (s *ImageSurface) Close() error {
 	s.img = nil
 	s.filler = nil
 	s.edgeBuilder = nil
+	s.clip = clipState{}
+	s.clipStack = nil
+	s.clipFiller = nil
+	s.clipEdgeBuilder = nil
+	s.clipMaskBuf = nil
+	s.clipScratch = nil
 	return nil
 }
 
@@ -256,7 +300,7 @@ func (s *ImageSurface) Capabilities() Capabilities {
 	return Capabilities{
 		SupportsSubSurface: false,
 		SupportsResize:     false,
-		SupportsClipping:   false,
+		SupportsClipping:   true,
 		SupportsBlendModes: false,
 		SupportsAntialias:  true,
 		MaxWidth:           0, // Unlimited
@@ -281,8 +325,26 @@ func (s *ImageSurface) resolveColor(c color.Color, _ Pattern) color.RGBA {
 	return color.RGBA{0, 0, 0, 255}
 }
 
-// blendRow blends alpha runs onto a scanline.
+// blendRow blends alpha runs onto a scanline, applying the clip mask if set.
 func (s *ImageSurface) blendRow(y int, runs *raster.AlphaRuns, c color.RGBA) {
+	if s.clip.mask != nil {
+		maskRow := s.clip.mask[y*s.width : y*s.width+s.width]
+		for x, alpha := range runs.Iter() {
+			if x < 0 || x >= s.width {
+				continue
+			}
+			m := maskRow[x]
+			if m == 0 {
+				continue
+			}
+			if m != 255 {
+				alpha = uint8(uint16(alpha) * uint16(m) / 255) //nolint:gosec // product/255 fits uint8
+			}
+			s.blendPixelAlpha(x, y, c, alpha)
+		}
+		return
+	}
+
 	for x, alpha := range runs.Iter() {
 		if x < 0 || x >= s.width {
 			continue
@@ -335,20 +397,6 @@ func (s *ImageSurface) blendPixelAlpha(x, y int, src color.RGBA, alpha uint8) {
 	s.img.Pix[idx+2] = uint8(outB)
 	//nolint:gosec // G115: safe
 	s.img.Pix[idx+3] = uint8(outA)
-}
-
-// blendPixel blends a color onto the image at (x, y).
-func (s *ImageSurface) blendPixel(x, y int, src color.Color) {
-	r, g, b, a := src.RGBA()
-	//nolint:gosec // G115: safe - r>>8 is always in [0, 255]
-	srcR := uint8(r >> 8)
-	//nolint:gosec // G115: safe
-	srcG := uint8(g >> 8)
-	//nolint:gosec // G115: safe
-	srcB := uint8(b >> 8)
-	//nolint:gosec // G115: safe
-	srcA := uint8(a >> 8)
-	s.blendPixelAlpha(x, y, color.RGBA{srcR, srcG, srcB, srcA}, 255)
 }
 
 // applyAlpha multiplies a color's alpha by the given factor.
@@ -607,3 +655,4 @@ func sqrtf32(x float32) float32 {
 // Verify ImageSurface implements Surface interface.
 var _ Surface = (*ImageSurface)(nil)
 var _ CapableSurface = (*ImageSurface)(nil)
+var _ ClippableSurface = (*ImageSurface)(nil)
