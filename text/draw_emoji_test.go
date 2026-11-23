@@ -90,7 +90,9 @@ func TestBitmapGlyphCache_Clear(t *testing.T) {
 }
 
 func TestBitmapGlyphCache_Eviction(t *testing.T) {
-	cache := NewBitmapGlyphCache(3)
+	// LRU eviction: when a shard is full, only its least-recently-used
+	// entry is evicted — the cache is never cleared wholesale.
+	cache := NewBitmapGlyphCache(bitmapCacheShardCount) // 1 entry per shard
 
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
 	bitmap := &emoji.BitmapGlyph{
@@ -99,26 +101,63 @@ func TestBitmapGlyphCache_Eviction(t *testing.T) {
 		Height:  16,
 	}
 
-	// Fill cache.
-	cache.Put(0x12345678, 100, 32, bitmap, img)
-	cache.Put(0x12345678, 101, 32, bitmap, img)
-	cache.Put(0x12345678, 102, 32, bitmap, img)
+	const fontID = uintptr(0x12345678)
 
-	if cache.Size() != 3 {
-		t.Errorf("Size() = %d, want 3", cache.Size())
+	// Two keys in the same shard, one in a different shard.
+	g1 := uint16(100)
+	g2 := sameShardGlyphID(cache, fontID, g1)
+	other := differentShardGlyphID(cache, fontID, g1)
+
+	cache.Put(fontID, g1, 32, bitmap, img)
+	cache.Put(fontID, other, 32, bitmap, img)
+
+	if cache.Size() != 2 {
+		t.Errorf("Size() = %d, want 2", cache.Size())
 	}
 
-	// Adding one more should trigger eviction.
-	cache.Put(0x12345678, 103, 32, bitmap, img)
+	// Adding a same-shard key evicts only the LRU entry in that shard.
+	cache.Put(fontID, g2, 32, bitmap, img)
 
-	// After eviction, only the new entry should remain.
-	if cache.Size() != 1 {
-		t.Errorf("Size() after eviction = %d, want 1", cache.Size())
+	if cache.Size() != 2 {
+		t.Errorf("Size() after eviction = %d, want 2", cache.Size())
 	}
 
-	// The new entry should be present.
-	if cache.Get(0x12345678, 103, 32) == nil {
+	// The evicted LRU entry is gone; the new and unrelated entries remain.
+	if cache.Get(fontID, g1, 32) != nil {
+		t.Error("Get() returned evicted LRU entry")
+	}
+	if cache.Get(fontID, g2, 32) == nil {
 		t.Error("Get() returned nil for newly added entry")
+	}
+	if cache.Get(fontID, other, 32) == nil {
+		t.Error("Get() returned nil for entry in unrelated shard")
+	}
+
+	stats := cache.Stats()
+	if stats.Evictions != 1 {
+		t.Errorf("Evictions = %d, want 1", stats.Evictions)
+	}
+}
+
+// sameShardGlyphID returns a glyph ID (different from g) whose key hashes
+// to the same shard as (fontID, g, 32) in cache.
+func sameShardGlyphID(cache *BitmapGlyphCache, fontID uintptr, g uint16) uint16 {
+	want := cache.shardFor(bitmapCacheKey{fontID: fontID, glyphID: g, ppem: 32})
+	for candidate := g + 1; ; candidate++ {
+		if cache.shardFor(bitmapCacheKey{fontID: fontID, glyphID: candidate, ppem: 32}) == want {
+			return candidate
+		}
+	}
+}
+
+// differentShardGlyphID returns a glyph ID whose key hashes to a different
+// shard than (fontID, g, 32) in cache.
+func differentShardGlyphID(cache *BitmapGlyphCache, fontID uintptr, g uint16) uint16 {
+	avoid := cache.shardFor(bitmapCacheKey{fontID: fontID, glyphID: g, ppem: 32})
+	for candidate := g + 1; ; candidate++ {
+		if cache.shardFor(bitmapCacheKey{fontID: fontID, glyphID: candidate, ppem: 32}) != avoid {
+			return candidate
+		}
 	}
 }
 

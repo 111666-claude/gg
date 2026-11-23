@@ -6,8 +6,6 @@ import (
 	"image/draw"
 
 	xdraw "golang.org/x/image/draw"
-
-	"github.com/gogpu/gg/text/emoji"
 )
 
 // DrawWithEmoji renders text with full color emoji support.
@@ -42,6 +40,7 @@ func drawWithColorSupport(dst draw.Image, text string, face Face, x, y float64, 
 	currentX := x
 	ppem := uint16(face.Size())
 	parsed := face.Source().Parsed()
+	fontID := bitmapCacheFontID(face)
 
 	for _, r := range text {
 		glyphID := parsed.GlyphIndex(r)
@@ -50,7 +49,7 @@ func drawWithColorSupport(dst draw.Image, text string, face Face, x, y float64, 
 
 		switch glyphType {
 		case GlyphTypeBitmap:
-			drawBitmapGlyph(dst, colorFont, glyphID, ppem, currentX, y)
+			drawBitmapGlyph(dst, colorFont, fontID, glyphID, ppem, currentX, y)
 
 		case GlyphTypeCOLR:
 			// TODO: Implement COLR rendering in Phase 2.
@@ -66,19 +65,36 @@ func drawWithColorSupport(dst draw.Image, text string, face Face, x, y float64, 
 	}
 }
 
+// sharedBitmapGlyphCache is the process-wide cache used by the emoji draw
+// path. High-frequency renderers (e.g. chat views) decode each emoji once.
+var sharedBitmapGlyphCache = NewBitmapGlyphCache(DefaultBitmapGlyphCacheEntries)
+
+// DefaultBitmapGlyphCache returns the shared cache used by DrawWithEmoji.
+// Use it to observe hit/miss statistics or to Clear the cache.
+func DefaultBitmapGlyphCache() *BitmapGlyphCache {
+	return sharedBitmapGlyphCache
+}
+
+// bitmapCacheFontID derives the cache key's font identity for a face.
+// ComputeFontID hashes the full font name and glyph count, so it is stable
+// across frames and safe against pointer reuse.
+func bitmapCacheFontID(face Face) uintptr {
+	if face == nil {
+		return 0
+	}
+	return uintptr(ComputeFontID(face.Source()))
+}
+
 // drawBitmapGlyph renders a bitmap glyph (CBDT or sbix).
-func drawBitmapGlyph(dst draw.Image, colorFont ColorFont, glyphID uint16, ppem uint16, x, y float64) {
-	bitmap, err := colorFont.BitmapGlyph(glyphID, ppem)
-	if err != nil {
+// Decoded bitmaps are cached in the shared BitmapGlyphCache; a load or
+// decode failure skips the glyph silently (as before).
+func drawBitmapGlyph(dst draw.Image, colorFont ColorFont, fontID uintptr, glyphID uint16, ppem uint16, x, y float64) {
+	bitmap := sharedBitmapGlyphCache.getOrLoad(colorFont, fontID, glyphID, ppem)
+	if bitmap == nil {
 		// Silently skip - could render tofu glyph instead.
 		return
 	}
-
-	// Decode PNG data.
-	img, err := bitmap.Decode()
-	if err != nil {
-		return
-	}
+	img := bitmap.Img
 
 	// Calculate scaling factor.
 	scale := float64(ppem) / float64(bitmap.PPEM)
@@ -129,69 +145,4 @@ func drawSingleOutlineGlyph(dst draw.Image, text string, face Face, glyphID uint
 			return
 		}
 	}
-}
-
-// BitmapGlyphCache caches decoded bitmap glyphs to avoid repeated PNG decoding.
-// This is important for performance when rendering the same emoji multiple times.
-type BitmapGlyphCache struct {
-	entries map[bitmapCacheKey]*CachedBitmap
-	maxSize int
-}
-
-// bitmapCacheKey uniquely identifies a cached bitmap.
-type bitmapCacheKey struct {
-	fontID  uintptr // Pointer to font for identity.
-	glyphID uint16
-	ppem    uint16
-}
-
-// CachedBitmap holds a decoded and optionally scaled bitmap.
-type CachedBitmap struct {
-	Img     image.Image
-	OriginX float32
-	OriginY float32
-	Width   int
-	Height  int
-}
-
-// NewBitmapGlyphCache creates a new bitmap glyph cache.
-// maxSize is the maximum number of cached entries.
-func NewBitmapGlyphCache(maxSize int) *BitmapGlyphCache {
-	return &BitmapGlyphCache{
-		entries: make(map[bitmapCacheKey]*CachedBitmap),
-		maxSize: maxSize,
-	}
-}
-
-// Get retrieves a cached bitmap, or nil if not cached.
-func (c *BitmapGlyphCache) Get(fontID uintptr, glyphID, ppem uint16) *CachedBitmap {
-	key := bitmapCacheKey{fontID: fontID, glyphID: glyphID, ppem: ppem}
-	return c.entries[key]
-}
-
-// Put stores a bitmap in the cache.
-func (c *BitmapGlyphCache) Put(fontID uintptr, glyphID, ppem uint16, bitmap *emoji.BitmapGlyph, img image.Image) {
-	// Simple eviction: clear when full.
-	if len(c.entries) >= c.maxSize {
-		c.Clear()
-	}
-
-	key := bitmapCacheKey{fontID: fontID, glyphID: glyphID, ppem: ppem}
-	c.entries[key] = &CachedBitmap{
-		Img:     img,
-		OriginX: bitmap.OriginX,
-		OriginY: bitmap.OriginY,
-		Width:   bitmap.Width,
-		Height:  bitmap.Height,
-	}
-}
-
-// Clear removes all entries from the cache.
-func (c *BitmapGlyphCache) Clear() {
-	c.entries = make(map[bitmapCacheKey]*CachedBitmap)
-}
-
-// Size returns the number of cached entries.
-func (c *BitmapGlyphCache) Size() int {
-	return len(c.entries)
 }
