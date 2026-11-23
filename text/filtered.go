@@ -152,6 +152,14 @@ func (f *FilteredFace) Variations() []FontVariation {
 // private implements the Face interface.
 func (f *FilteredFace) private() {}
 
+// colorPalette implements facePalette by delegating to the wrapped face.
+func (f *FilteredFace) colorPalette() int {
+	if p, ok := f.face.(facePalette); ok {
+		return p.colorPalette()
+	}
+	return -1
+}
+
 // inRanges reports whether the rune is in any of the allowed ranges.
 // If no ranges are specified, returns true (no filtering).
 func (f *FilteredFace) inRanges(r rune) bool {

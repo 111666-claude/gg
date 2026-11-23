@@ -52,4 +52,8 @@ BENCHMARK_RESULTS*.md
 docs/dev/
 docs/research/
 
+# Python tooling virtualenvs (fixture generators under artifacts/ are tracked)
+artifacts/**/venv/
+__pycache__/
+
 tmp/

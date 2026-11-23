@@ -172,6 +172,15 @@ func (m *MultiFace) Variations() []FontVariation {
 // private implements the Face interface.
 func (m *MultiFace) private() {}
 
+// colorPalette implements facePalette by delegating to the first face,
+// matching how MultiFace exposes the other face-level settings.
+func (m *MultiFace) colorPalette() int {
+	if p, ok := m.faces[0].(facePalette); ok {
+		return p.colorPalette()
+	}
+	return -1
+}
+
 // faceForRune returns the first face that has the glyph for the rune.
 // If no face has the glyph, returns the first face as fallback.
 func (m *MultiFace) faceForRune(r rune) Face {

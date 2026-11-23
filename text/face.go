@@ -56,6 +56,23 @@ type Face interface {
 	private()
 }
 
+// facePalette is the optional accessor implemented by faces that carry a
+// CPAL palette selection (WithColorPalette). It is kept off the public Face
+// interface so external implementations remain source-compatible.
+type facePalette interface {
+	colorPalette() int
+}
+
+// FaceColorPalette returns the CPAL palette index configured on a face, or
+// -1 when no explicit palette was set. Handles source faces and the wrapping
+// MultiFace/FilteredFace types; unknown face implementations report -1.
+func FaceColorPalette(face Face) int {
+	if p, ok := face.(facePalette); ok {
+		return p.colorPalette()
+	}
+	return -1
+}
+
 // sourceFace is the internal implementation of Face.
 type sourceFace struct {
 	source *FontSource
@@ -301,3 +318,6 @@ func (f *sourceFace) Variations() []FontVariation {
 
 // private implements the Face interface.
 func (f *sourceFace) private() {}
+
+// colorPalette implements facePalette, exposing the WithColorPalette setting.
+func (f *sourceFace) colorPalette() int { return f.config.palette }

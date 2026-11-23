@@ -18,6 +18,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+
+	"github.com/gogpu/gg/text/emoji"
 )
 
 // ownParser implements FontParser using pure Go binary parsing.
@@ -123,6 +125,16 @@ type ownParsedFont struct {
 	cffOnce sync.Once
 	cff     *cffFont
 	cffErr  error
+
+	// Color tables (COLR/CPAL, CBDT/CBLC, sbix) — lazily loaded on the
+	// first ColorFont method call. colorInit guards the whole block; the
+	// individual pointers stay nil when their table is absent or malformed
+	// so color rendering transparently degrades to monochrome outlines.
+	colorInit  sync.Once
+	colrParser *emoji.COLRParser // nil unless both COLR and CPAL are valid
+	cbdt       *emoji.CBDTExtractor
+	sbix       *emoji.SBIXParser
+	hasColor   bool // true once at least one color table is present
 }
 
 // --- ParsedFont interface ---

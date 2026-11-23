@@ -181,6 +181,7 @@ type faceConfig struct {
 	language   string
 	features   []FontFeature   // OpenType features (tnum, liga, etc.)
 	variations []FontVariation // Font variation axes (wght, wdth, etc.)
+	palette    int             // CPAL palette index for COLR glyphs (-1 = font default 0)
 }
 
 // defaultFaceConfig returns the default face configuration.
@@ -189,6 +190,7 @@ func defaultFaceConfig() faceConfig {
 		direction: DirectionLTR,
 		hinting:   HintingFull,
 		language:  "en",
+		palette:   -1,
 	}
 }
 
@@ -249,5 +251,18 @@ func WithFeatures(features ...FontFeature) FaceOption {
 func WithVariations(variations ...FontVariation) FaceOption {
 	return func(c *faceConfig) {
 		c.variations = variations
+	}
+}
+
+// WithColorPalette selects the CPAL palette used when rendering COLR color
+// glyphs. Index 0 is the font's default palette. A negative value restores
+// the default. An index beyond the font's palette count is accepted here but
+// deterministically falls back to palette 0 at render time, so callers can
+// request a theme palette without probing the font first.
+//
+// Non-COLR fonts and plain outline glyphs ignore this option.
+func WithColorPalette(paletteIndex int) FaceOption {
+	return func(c *faceConfig) {
+		c.palette = paletteIndex
 	}
 }

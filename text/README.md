@@ -237,7 +237,11 @@ Emoji and color font support.
 
 - **Detection** — IsEmoji, IsZWJ, IsRegionalIndicator
 - **Sequences** — ZWJ, flags, skin tones, keycaps
-- **COLRv0/v1** — Color glyph parsing and rendering
+- **COLRv0** — Layered glyph parsing plus a hardened CPAL palette reader
+  (range checks, 256-layer cap, foreground sentinel, transparent-entry
+  detection); `DrawWithEmojiOptions` composites layers bottom-to-top through
+  the shared glyph-mask rasterizer with palette switching, foreground color
+  override and global alpha
 - **sbix/CBDT** — Bitmap emoji (PNG, JPEG, TIFF)
 
 ## Test Coverage

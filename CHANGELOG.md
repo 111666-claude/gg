@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **COLR/CPAL layered glyph rendering** — `DrawWithEmoji` now renders COLRv0
+  color glyphs for real instead of falling back to monochrome outlines. Layers
+  are read from the COLR table in glyph order, resolved against CPAL palettes
+  and composited bottom-to-top through the existing 256-level glyph-mask
+  rasterizer, so transforms, ppem, subpixel positioning and MultiFace
+  fallback behave like the monochrome path. New APIs:
+  `text.DrawWithEmojiOptions` (palette index, global alpha, foreground color
+  override) and `text.WithColorPalette` face option. Unknown palettes fall
+  back to palette 0; missing tables, bad layer glyphs, cyclic references,
+  out-of-range palette entries, transparent colors and oversized layer lists
+  are rejected with glyph-ID-bearing errors or degrade to monochrome without
+  panicking. Fixed fixtures in `text/testdata/colr_*.ttf` cover multi-layer
+  pixels, palette switching, scaling, CPU pixmap rendering and the existing
+  text/emoji suites.
+
 ### Fixed
 
 - **Arbitrary-path clips draw their content in gogpu windows** — with a circle, star or any other non-rectangular

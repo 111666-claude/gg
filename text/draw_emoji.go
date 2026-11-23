@@ -10,59 +10,149 @@ import (
 	"github.com/gogpu/gg/text/emoji"
 )
 
+// EmojiOptions controls color rendering in [DrawWithEmojiOptions].
+//
+// The zero value is valid: palette 0 is used, no extra alpha is applied,
+// and the text color passed to the draw call paints foreground layers.
+type EmojiOptions struct {
+	// Palette selects the CPAL palette for COLR glyphs. Negative values and
+	// indices beyond the font's palette count fall back to palette 0.
+	// A face-level WithColorPalette selection is used when this is left at 0
+	// and the face carries one.
+	Palette int
+
+	// Alpha is an additional global opacity multiplied into every color
+	// layer (palette and foreground alike). The zero value means no extra
+	// alpha (fully opaque), matching plain DrawWithEmoji; set a value in
+	// (0,1) to fade the glyph toward transparent.
+	Alpha float64
+
+	// Foreground overrides the color used for COLR foreground layers
+	// (palette index 0xFFFF). When nil, the color.Color argument of the
+	// draw call is used.
+	Foreground color.Color
+
+	// ExplicitPalette is true when Palette was set by the caller and must
+	// take precedence over the face-level WithColorPalette option.
+	ExplicitPalette bool
+}
+
 // DrawWithEmoji renders text with full color emoji support.
 // This function detects glyph types and routes to appropriate renderers:
-//   - Outline glyphs: Standard font.Drawer rendering
+//   - Outline glyphs: standard per-glyph rasterization
 //   - Bitmap glyphs: PNG bitmap scaling and compositing
-//   - COLR glyphs: Layer-based color glyph rendering (future)
+//   - COLR glyphs: layered vector glyph rendering via COLR/CPAL
 //
 // Position (x, y) is the baseline origin.
-// For fonts without color tables, this behaves identically to Draw().
+// For fonts without color tables, this behaves identically to [Draw].
 func DrawWithEmoji(dst draw.Image, text string, face Face, x, y float64, col color.Color) {
+	DrawWithEmojiOptions(dst, text, face, x, y, col, EmojiOptions{})
+}
+
+// DrawWithEmojiOptions is [DrawWithEmoji] with explicit control over the
+// COLR palette, global alpha and foreground-layer color.
+//
+// Layer compositing order, subpixel positioning and advances match the
+// monochrome [Draw] path: each rune consumes exactly the advance the face
+// reports for it, regardless of how many COLR layers it contains, so mixed
+// color/monochrome strings keep a single cursor.
+func DrawWithEmojiOptions(dst draw.Image, text string, face Face, x, y float64, col color.Color, opts EmojiOptions) {
 	if text == "" || face == nil {
 		return
 	}
 
-	// Check if the font has color tables.
-	parsed := face.Source().Parsed()
-	colorFont, hasColor := parsed.(ColorFont)
+	// Resolve the effective palette: explicit option > face option > default.
+	if !opts.ExplicitPalette {
+		if fp := FaceColorPalette(face); fp >= 0 {
+			opts.Palette = fp
+		}
+	}
 
+	drawColorRunes(dst, text, face, x, y, col, opts, 0)
+}
+
+// drawColorRunes renders text one rune at a time, dispatching on the face
+// that actually owns each rune. This is what makes MultiFace fallback work:
+// a rune is rendered with the same face that supplies its advance.
+//
+// advanceX is the cursor offset from the call's origin; it is non-zero only
+// for the recursive MultiFace/FilteredFace paths.
+func drawColorRunes(dst draw.Image, text string, face Face, x, y float64, col color.Color, opts EmojiOptions, advanceX float64) {
+	switch f := face.(type) {
+	case *sourceFace:
+		drawColorSourceFace(dst, text, f, x, y, col, opts, advanceX)
+	case *MultiFace:
+		drawColorMultiFace(dst, text, f, x, y, col, opts, advanceX)
+	case *FilteredFace:
+		drawColorFilteredFace(dst, text, f, x, y, col, opts, advanceX)
+	default:
+		// Unknown face implementation: preserve the pre-existing behavior.
+		Draw(dst, text, face, x+advanceX, y, col)
+	}
+}
+
+// drawColorSourceFace handles the concrete rendering for a source face.
+func drawColorSourceFace(dst draw.Image, text string, sf *sourceFace, x, y float64, col color.Color, opts EmojiOptions, advanceX float64) {
+	parsed := sf.Source().Parsed()
+	colorFont, hasColor := parsed.(ColorFont)
 	if !hasColor || !colorFont.HasColorTables() {
-		// No color support, fall back to standard rendering.
-		Draw(dst, text, face, x, y, col)
+		// No color support: the standard path is bit-for-bit unchanged.
+		drawSourceFace(dst, text, sf, x+advanceX, y, col)
 		return
 	}
 
-	// Color-aware rendering.
-	drawWithColorSupport(dst, text, face, x, y, col, colorFont)
-}
-
-// drawWithColorSupport renders text with glyph type detection.
-func drawWithColorSupport(dst draw.Image, text string, face Face, x, y float64, col color.Color, colorFont ColorFont) {
-	currentX := x
-	ppem := uint16(face.Size())
-	parsed := face.Source().Parsed()
-
+	ppem := sf.size
+	cursor := x + advanceX
 	for _, r := range text {
+		if r < 0x20 && r != '\t' {
+			continue
+		}
 		glyphID := parsed.GlyphIndex(r)
-		advance := parsed.GlyphAdvance(glyphID, face.Size())
-		glyphType := colorFont.GlyphType(glyphID)
+		advance := parsed.GlyphAdvance(glyphID, ppem)
 
-		switch glyphType {
+		switch colorFont.GlyphType(glyphID) {
 		case GlyphTypeBitmap:
-			drawBitmapGlyph(dst, colorFont, glyphID, ppem, currentX, y)
-
+			drawBitmapGlyph(dst, colorFont, glyphID, uint16(ppem), cursor, y)
 		case GlyphTypeCOLR:
-			// TODO: Implement COLR rendering in Phase 2.
-			// For now, fall back to outline.
-			drawSingleOutlineGlyph(dst, text, face, glyphID, currentX, y, col)
-
+			drawCOLRGlyph(dst, sf, colorFont, glyphID, ppem, cursor, y, col, opts)
 		default:
-			// GlyphTypeOutline, GlyphTypeSVG (not yet supported), and unknown types.
-			drawSingleOutlineGlyph(dst, text, face, glyphID, currentX, y, col)
+			drawSingleRuneOutline(dst, sf, r, cursor, y, col)
 		}
 
-		currentX += advance
+		cursor += advance
+	}
+}
+
+// drawColorMultiFace mirrors [drawMultiFace]'s face selection so the color
+// path stays in lockstep with monochrome fallback positioning.
+func drawColorMultiFace(dst draw.Image, text string, mf *MultiFace, x, y float64, col color.Color, opts EmojiOptions, advanceX float64) {
+	cursor := x + advanceX
+	for _, r := range text {
+		if r < 0x20 && r != '\t' {
+			continue
+		}
+		faceToUse := mf.faceForRune(r)
+		// Recurse with the selected concrete face; its advance drives the
+		// cursor exactly as drawMultiFace does.
+		drawColorRunes(dst, string(r), faceToUse, cursor, y, col, opts, 0)
+		cursor += faceGlyphAdvance(faceToUse, string(r))
+	}
+}
+
+// drawColorFilteredFace mirrors [drawFilteredFace]: runes outside the
+// allowed ranges are skipped entirely, including their advance.
+func drawColorFilteredFace(dst draw.Image, text string, ff *FilteredFace, x, y float64, col color.Color, opts EmojiOptions, advanceX float64) {
+	cursor := x + advanceX
+	for _, r := range text {
+		if r < 0x20 && r != '\t' {
+			continue
+		}
+		if !ff.inRanges(r) {
+			continue
+		}
+		runeStr := string(r)
+		drawColorRunes(dst, runeStr, ff.face, cursor, y, col, opts, 0)
+		cursor += faceGlyphAdvance(ff.face, runeStr)
 	}
 }
 
@@ -111,24 +201,11 @@ func drawBitmapGlyph(dst draw.Image, colorFont ColorFont, glyphID uint16, ppem u
 	xdraw.CatmullRom.Scale(dst, destRect, img, img.Bounds(), xdraw.Over, nil)
 }
 
-// drawSingleOutlineGlyph renders a single outline glyph.
-// This is a placeholder - ideally we'd render just the glyph without creating a full drawer.
-func drawSingleOutlineGlyph(dst draw.Image, text string, face Face, glyphID uint16, x, y float64, col color.Color) {
-	// For now, delegate to the standard Draw function with a single-rune string.
-	// This is inefficient but correct. A better implementation would:
-	// 1. Get the glyph outline path
-	// 2. Rasterize directly to the destination
-	//
-	// TODO: Optimize in Phase 3 with direct glyph rendering.
-
-	// Find the rune for this glyph ID.
-	parsed := face.Source().Parsed()
-	for _, r := range text {
-		if parsed.GlyphIndex(r) == glyphID {
-			Draw(dst, string(r), face, x, y, col)
-			return
-		}
-	}
+// drawSingleRuneOutline renders one rune through the standard monochrome
+// pipeline. The source face path takes the same per-glyph loop as [Draw] so
+// hinting and subpixel placement are identical.
+func drawSingleRuneOutline(dst draw.Image, sf *sourceFace, r rune, x, y float64, col color.Color) {
+	drawSourceFace(dst, string(r), sf, x, y, col)
 }
 
 // BitmapGlyphCache caches decoded bitmap glyphs to avoid repeated PNG decoding.
