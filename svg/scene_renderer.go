@@ -108,6 +108,10 @@ func renderSceneElement(target *scene.Scene, element Element, state *renderState
 		}
 	case *GroupElement:
 		renderSceneGroup(target, e, state)
+	case *UseElement:
+		renderSceneUse(target, e, state)
+	case *SymbolElement:
+		// Symbols only render through <use>.
 	}
 }
 
@@ -126,6 +130,69 @@ func renderSceneGroup(target *scene.Scene, group *GroupElement, state *renderSta
 		target.PushLayer(scene.BlendNormal, float32(group.Attrs.Opacity), nil)
 	}
 	renderSceneElements(target, group.Children, &child)
+	if layered {
+		target.PopLayer()
+	}
+}
+
+// renderSceneUse is the retained-mode counterpart of renderUse: it instantiates
+// the referenced element in an isolated inherited state, preserving vector
+// geometry and document order.
+func renderSceneUse(target *scene.Scene, use *UseElement, state *renderState) {
+	if use == nil || use.Ref == nil {
+		return
+	}
+	placement := usePlacementMatrix(use)
+
+	child := *state
+	child.matrix = state.matrix.Multiply(placement)
+	child.outerMatrix = state.outerMatrix.Multiply(placement)
+	child.opacity = state.opacity * use.Attrs.Opacity
+	if use.Attrs.Fill != "" {
+		child.parentFill = use.Attrs.Fill
+	}
+	if use.Attrs.Stroke != "" {
+		child.parentStroke = use.Attrs.Stroke
+	}
+
+	layered := use.Attrs.Opacity < 1
+	if layered {
+		target.PushLayer(scene.BlendNormal, float32(use.Attrs.Opacity), nil)
+	}
+	switch ref := use.Ref.(type) {
+	case *SymbolElement:
+		renderSceneSymbol(target, ref, use, &child)
+	default:
+		renderSceneElement(target, ref, &child)
+	}
+	if layered {
+		target.PopLayer()
+	}
+}
+
+// renderSceneSymbol maps the symbol viewBox onto the instance viewport before
+// emitting the symbol's children as retained commands.
+func renderSceneSymbol(target *scene.Scene, symbol *SymbolElement, use *UseElement, state *renderState) {
+	viewportWidth, viewportHeight := symbolViewportSize(use)
+
+	child := *state
+	if symbol.Attrs.Fill != "" {
+		child.parentFill = symbol.Attrs.Fill
+	}
+	if symbol.Attrs.Stroke != "" {
+		child.parentStroke = symbol.Attrs.Stroke
+	}
+	child.opacity = state.opacity * symbol.Attrs.Opacity
+
+	mapping := viewBoxMapping(symbol.ViewBox, viewportWidth, viewportHeight, symbol.PreserveAspectRatio)
+	child.matrix = state.matrix.Multiply(mapping)
+	child.outerMatrix = state.outerMatrix.Multiply(mapping)
+
+	layered := symbol.Attrs.Opacity < 1
+	if layered {
+		target.PushLayer(scene.BlendNormal, float32(symbol.Attrs.Opacity), nil)
+	}
+	renderSceneElements(target, symbol.Children, &child)
 	if layered {
 		target.PopLayer()
 	}

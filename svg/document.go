@@ -18,6 +18,11 @@ type Document struct {
 
 	// Elements contains the top-level SVG elements.
 	Elements []Element
+
+	// defs maps every element carrying an id attribute to that id. Elements
+	// inside <defs> never appear in Elements but remain reachable through this
+	// registry, which <use> elements resolve against after parsing.
+	defs map[string]Element
 }
 
 // ViewBox represents the SVG viewBox attribute.
@@ -112,3 +117,54 @@ type GroupElement struct {
 }
 
 func (e *GroupElement) attrs() *Attrs { return &e.Attrs }
+
+// SymbolElement represents an SVG <symbol> (or nested <svg>) element. Symbols
+// are never rendered directly: they define reusable viewport-scoped content
+// instantiated through <use>. When referenced, ViewBox is mapped onto the
+// instance viewport according to PreserveAspectRatio.
+type SymbolElement struct {
+	Attrs Attrs
+
+	// ID is the symbol's document-unique identifier (may be empty for
+	// unreferenced symbols).
+	ID string
+
+	// ViewBox is the symbol's own coordinate system. A zero Width or Height
+	// means the symbol has no viewBox and its children use the instance
+	// coordinate system directly.
+	ViewBox ViewBox
+
+	// PreserveAspectRatio holds the raw preserveAspectRatio attribute,
+	// defaulting to "xMidYMid meet" when empty.
+	PreserveAspectRatio string
+
+	Children []Element
+}
+
+func (e *SymbolElement) attrs() *Attrs { return &e.Attrs }
+
+// UseElement represents an SVG <use> element that instantiates a referenced
+// element by document order. Ref is resolved during Parse and points at the
+// referenced element in the same document; the element itself is never
+// mutated, so each instance keeps independent style inheritance and geometry.
+type UseElement struct {
+	Attrs Attrs
+
+	// HRef is the raw reference (typically "#id").
+	HRef string
+
+	// X, Y place the instance; width/height size the viewport for symbol and
+	// nested-svg references and are ignored for other targets.
+	X, Y          float64
+	Width, Height float64
+
+	// hasWidth/hasHeight distinguish an omitted attribute from an explicit zero.
+	hasWidth, hasHeight bool
+
+	// Ref is the post-parse resolution of HRef.
+	Ref Element
+
+	pos SourcePos
+}
+
+func (e *UseElement) attrs() *Attrs { return &e.Attrs }

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <defs>
+    <symbol id="empty" viewBox="0 0 16 16"></symbol>
+  </defs>
+  <rect x="0" y="0" width="16" height="16" fill="#EEEEEE"/>
+  <use href="#empty" x="0" y="0" width="16" height="16" fill="#FF0000"/>
+</svg>

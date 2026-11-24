@@ -90,6 +90,11 @@ func renderElement(dc *gg.Context, elem Element, state *renderState) {
 		}
 	case *GroupElement:
 		renderGroup(dc, e, state)
+	case *UseElement:
+		renderUse(dc, e, state)
+	case *SymbolElement:
+		// Symbols only render through <use>; a symbol encountered directly
+		// (e.g. one declared outside <defs>) produces nothing in place.
 	}
 }
 

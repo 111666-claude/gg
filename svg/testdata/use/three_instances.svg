@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="16" viewBox="0 0 48 16">
+  <defs>
+    <symbol id="dot" viewBox="0 0 16 16">
+      <circle cx="8" cy="8" r="6"/>
+    </symbol>
+  </defs>
+  <use href="#dot" x="0"  y="0" width="16" height="16" fill="#FF0000"/>
+  <use href="#dot" x="16" y="0" width="16" height="16" fill="#00FF00" transform="rotate(45 24 8)"/>
+  <use href="#dot" x="32" y="0" width="16" height="16" fill="#0000FF" opacity="0.5"/>
+</svg>

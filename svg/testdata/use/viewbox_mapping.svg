@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="16" viewBox="0 0 32 16">
+  <defs>
+    <symbol id="sq" viewBox="0 0 10 10">
+      <rect x="0" y="0" width="10" height="10" fill="#FF0000"/>
+    </symbol>
+    <symbol id="stretch" viewBox="0 0 10 10" preserveAspectRatio="none">
+      <rect x="0" y="0" width="10" height="10" fill="#0000FF"/>
+    </symbol>
+  </defs>
+  <use href="#sq" x="0" y="0" width="12" height="16"/>
+  <use href="#stretch" x="16" y="0" width="16" height="16"/>
+</svg>

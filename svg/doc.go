@@ -15,6 +15,16 @@
 //   - <polygon> points
 //   - <polyline> points
 //   - <g> grouping with inherited attributes and transform
+//   - <defs> reusable definitions registered by id
+//   - <symbol> (and nested <svg>) with viewBox and preserveAspectRatio
+//   - <use> instances with href/xlink:href, x/y, width/height and transform
+//
+// <use> resolves same-document #id references to any element with an id,
+// including groups and symbols. Each instance gets independent fill, stroke
+// and opacity inheritance and its own viewBox viewport; referenced elements
+// are never mutated. Missing, circular, cross-document and duplicate-id
+// references, illegal dimensions and instance chains deeper than 32 levels
+// produce positioned parse errors.
 //
 // # Supported Attributes
 //
@@ -22,6 +32,11 @@
 //   - stroke, stroke-width, stroke-linecap, stroke-linejoin, stroke-opacity
 //   - transform (translate, rotate, scale, matrix)
 //   - opacity
+//   - id, href and xlink:href
+//   - x, y, width, height and preserveAspectRatio on <use>/<symbol>
+//
+// Unknown attributes are silently ignored, matching the package's historical
+// best-effort handling of unsupported markup.
 //
 // # Usage
 //

@@ -12,13 +12,15 @@ import (
 // The Document can be rendered multiple times at different sizes.
 //
 // Only the SVG subset needed for icon rendering is supported.
-// Unsupported elements are silently skipped.
+// Unsupported elements are silently skipped, except for <defs>, <symbol> and
+// <use>, which power reusable symbol instances.
 func Parse(data []byte) (*Document, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 
 	doc := &Document{
 		ViewBox: ViewBox{Width: 16, Height: 16}, // sensible default
 	}
+	pc := newParseContext(data)
 
 	// Find the root <svg> element.
 	for {
@@ -31,11 +33,15 @@ func Parse(data []byte) (*Document, error) {
 				return nil, err
 			}
 			// Parse children.
-			children, err := parseChildren(decoder)
+			children, err := parseChildren(decoder, pc)
 			if err != nil {
 				return nil, err
 			}
+			if err := pc.resolveUses(); err != nil {
+				return nil, err
+			}
 			doc.Elements = children
+			doc.defs = pc.defs
 			return doc, nil
 		}
 	}
@@ -116,7 +122,7 @@ func parseDimension(s string) (float64, error) {
 }
 
 // parseChildren parses child elements until the matching end element is found.
-func parseChildren(decoder *xml.Decoder) ([]Element, error) {
+func parseChildren(decoder *xml.Decoder, pc *parseContext) ([]Element, error) {
 	var elements []Element
 
 	for {
@@ -127,7 +133,8 @@ func parseChildren(decoder *xml.Decoder) ([]Element, error) {
 
 		switch t := tok.(type) {
 		case xml.StartElement:
-			elem, err := parseElement(decoder, t)
+			pos := pc.positionAt(decoder.InputOffset())
+			elem, err := parseElement(decoder, t, pc, pos)
 			if err != nil {
 				return nil, err
 			}
@@ -142,32 +149,49 @@ func parseChildren(decoder *xml.Decoder) ([]Element, error) {
 }
 
 // parseElement parses a single SVG element from a start element.
-// Returns nil for unsupported elements (silently skipped).
-func parseElement(decoder *xml.Decoder, se xml.StartElement) (Element, error) {
+// Returns nil for unsupported elements (silently skipped) and for elements
+// that only define reusable content (<defs>, <symbol>).
+func parseElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (Element, error) {
 	switch se.Name.Local {
 	case "path":
-		return parsePathElement(decoder, se)
+		return parsePathElement(decoder, se, pc, pos)
 	case "circle":
-		return parseCircleElement(decoder, se)
+		return parseCircleElement(decoder, se, pc, pos)
 	case "rect":
-		return parseRectElement(decoder, se)
+		return parseRectElement(decoder, se, pc, pos)
 	case "ellipse":
-		return parseEllipseElement(decoder, se)
+		return parseEllipseElement(decoder, se, pc, pos)
 	case "line":
-		return parseLineElement(decoder, se)
+		return parseLineElement(decoder, se, pc, pos)
 	case "polygon":
-		return parsePolygonElement(decoder, se)
+		return parsePolygonElement(decoder, se, pc, pos)
 	case "polyline":
-		return parsePolylineElement(decoder, se)
+		return parsePolylineElement(decoder, se, pc, pos)
 	case "g":
-		return parseGroupElement(decoder, se)
+		return parseGroupElement(decoder, se, pc, pos)
+	case "defs":
+		return parseDefsElement(decoder, se, pc, pos)
+	case "symbol", "svg":
+		return parseSymbolElement(decoder, se, pc, pos)
+	case "use":
+		return parseUseElement(decoder, se, pc, pos)
 	default:
-		// Skip unsupported elements (defs, clipPath, use, text, etc.).
+		// Skip unsupported elements (clipPath, text, etc.).
 		if err := decoder.Skip(); err != nil {
 			return nil, fmt.Errorf("svg: error skipping <%s>: %w", se.Name.Local, err)
 		}
 		return nil, nil //nolint:nilnil // nil element means "skip this element"
 	}
+}
+
+// elementID returns the id attribute of a start element, or "" when absent.
+func elementID(se xml.StartElement) string {
+	for _, attr := range se.Attr {
+		if attr.Name.Local == "id" {
+			return attr.Value
+		}
+	}
+	return ""
 }
 
 // parseAttrs extracts common SVG presentation attributes from an element.
@@ -216,7 +240,7 @@ func parseAttrs(se xml.StartElement) Attrs {
 }
 
 // parsePathElement parses a <path> element.
-func parsePathElement(decoder *xml.Decoder, se xml.StartElement) (*PathElement, error) {
+func parsePathElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*PathElement, error) {
 	elem := &PathElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		if attr.Name.Local == "d" {
@@ -226,11 +250,14 @@ func parsePathElement(decoder *xml.Decoder, se xml.StartElement) (*PathElement, 
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <path>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parseCircleElement parses a <circle> element.
-func parseCircleElement(decoder *xml.Decoder, se xml.StartElement) (*CircleElement, error) {
+func parseCircleElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*CircleElement, error) {
 	elem := &CircleElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		switch attr.Name.Local {
@@ -245,11 +272,14 @@ func parseCircleElement(decoder *xml.Decoder, se xml.StartElement) (*CircleEleme
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <circle>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parseRectElement parses a <rect> element.
-func parseRectElement(decoder *xml.Decoder, se xml.StartElement) (*RectElement, error) {
+func parseRectElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*RectElement, error) {
 	elem := &RectElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		switch attr.Name.Local {
@@ -270,11 +300,14 @@ func parseRectElement(decoder *xml.Decoder, se xml.StartElement) (*RectElement, 
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <rect>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parseEllipseElement parses an <ellipse> element.
-func parseEllipseElement(decoder *xml.Decoder, se xml.StartElement) (*EllipseElement, error) {
+func parseEllipseElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*EllipseElement, error) {
 	elem := &EllipseElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		switch attr.Name.Local {
@@ -291,11 +324,14 @@ func parseEllipseElement(decoder *xml.Decoder, se xml.StartElement) (*EllipseEle
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <ellipse>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parseLineElement parses a <line> element.
-func parseLineElement(decoder *xml.Decoder, se xml.StartElement) (*LineElement, error) {
+func parseLineElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*LineElement, error) {
 	elem := &LineElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		switch attr.Name.Local {
@@ -312,11 +348,14 @@ func parseLineElement(decoder *xml.Decoder, se xml.StartElement) (*LineElement, 
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <line>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parsePolygonElement parses a <polygon> element.
-func parsePolygonElement(decoder *xml.Decoder, se xml.StartElement) (*PolygonElement, error) {
+func parsePolygonElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*PolygonElement, error) {
 	elem := &PolygonElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		if attr.Name.Local == "points" {
@@ -330,11 +369,14 @@ func parsePolygonElement(decoder *xml.Decoder, se xml.StartElement) (*PolygonEle
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <polygon>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parsePolylineElement parses a <polyline> element.
-func parsePolylineElement(decoder *xml.Decoder, se xml.StartElement) (*PolylineElement, error) {
+func parsePolylineElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*PolylineElement, error) {
 	elem := &PolylineElement{Attrs: parseAttrs(se)}
 	for _, attr := range se.Attr {
 		if attr.Name.Local == "points" {
@@ -348,17 +390,120 @@ func parsePolylineElement(decoder *xml.Decoder, se xml.StartElement) (*PolylineE
 	if err := decoder.Skip(); err != nil {
 		return nil, fmt.Errorf("svg: error reading <polyline>: %w", err)
 	}
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
 	return elem, nil
 }
 
 // parseGroupElement parses a <g> element and its children recursively.
-func parseGroupElement(decoder *xml.Decoder, se xml.StartElement) (*GroupElement, error) {
+func parseGroupElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*GroupElement, error) {
 	elem := &GroupElement{Attrs: parseAttrs(se)}
-	children, err := parseChildren(decoder)
+	children, err := parseChildren(decoder, pc)
 	if err != nil {
 		return nil, err
 	}
 	elem.Children = children
+	if err := pc.registerID(elementID(se), se.Name.Local, elem, pos); err != nil {
+		return nil, err
+	}
+	return elem, nil
+}
+
+// parseDefsElement parses a <defs> element. Its subtree is retained only
+// through the id registry: defs content is never rendered in place. Returns a
+// nil element so the render tree excludes it.
+func parseDefsElement(decoder *xml.Decoder, _ xml.StartElement, pc *parseContext, _ SourcePos) (Element, error) {
+	if _, err := parseChildren(decoder, pc); err != nil {
+		return nil, err
+	}
+	return nil, nil //nolint:nilnil // defs content is registry-only
+}
+
+// parseSymbolElement parses a <symbol> or nested <svg> element. Symbols are
+// registered by id when present but never rendered where they are declared.
+func parseSymbolElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*SymbolElement, error) {
+	elem := &SymbolElement{
+		Attrs: parseAttrs(se),
+		ID:    elementID(se),
+	}
+	for _, attr := range se.Attr {
+		switch attr.Name.Local {
+		case "viewBox":
+			vb, err := parseViewBox(attr.Value)
+			if err != nil {
+				return nil, elementErrorf(pos, se.Name.Local, "%v", err)
+			}
+			elem.ViewBox = vb
+		case "preserveAspectRatio":
+			elem.PreserveAspectRatio = attr.Value
+		}
+	}
+	if elem.ViewBox.Width < 0 || elem.ViewBox.Height < 0 {
+		return nil, elementErrorf(pos, se.Name.Local,
+			"invalid viewBox %v: width and height must not be negative", elem.ViewBox)
+	}
+	children, err := parseChildren(decoder, pc)
+	if err != nil {
+		return nil, err
+	}
+	elem.Children = children
+	if elem.ID != "" {
+		if err := pc.registerID(elem.ID, se.Name.Local, elem, pos); err != nil {
+			return nil, err
+		}
+	}
+	return elem, nil // returned to caller; renderers skip direct symbol nodes
+}
+
+// xlinkNamespace is the legacy XLink namespace used by pre-SVG2 documents for
+// the xlink:href attribute.
+const xlinkNamespace = "http://www.w3.org/1999/xlink"
+
+// parseUseElement parses a <use> element. Both SVG2 href and the legacy
+// xlink:href namespace are accepted, with a namespaceless href taking
+// precedence when both appear. The reference itself is resolved after the
+// full document is parsed.
+func parseUseElement(decoder *xml.Decoder, se xml.StartElement, pc *parseContext, pos SourcePos) (*UseElement, error) {
+	elem := &UseElement{Attrs: parseAttrs(se), pos: pos}
+	for _, attr := range se.Attr {
+		if attr.Name.Local == "href" {
+			// encoding/xml reports xlink:href as Local="href" with the XLink
+			// namespace; treat it as a fallback so SVG2 href wins.
+			if attr.Name.Space == xlinkNamespace {
+				if elem.HRef == "" {
+					elem.HRef = attr.Value
+				}
+			} else {
+				elem.HRef = attr.Value
+			}
+			continue
+		}
+		switch attr.Name.Local {
+		case "x":
+			elem.X, _ = strconv.ParseFloat(attr.Value, 64)
+		case "y":
+			elem.Y, _ = strconv.ParseFloat(attr.Value, 64)
+		case "width":
+			elem.hasWidth = true
+			v, err := parseDimension(attr.Value)
+			if err != nil {
+				return nil, elementErrorf(pos, "use", "invalid width %q: %v", attr.Value, err)
+			}
+			elem.Width = v
+		case "height":
+			elem.hasHeight = true
+			v, err := parseDimension(attr.Value)
+			if err != nil {
+				return nil, elementErrorf(pos, "use", "invalid height %q: %v", attr.Value, err)
+			}
+			elem.Height = v
+		}
+	}
+	if err := decoder.Skip(); err != nil {
+		return nil, fmt.Errorf("svg: error reading <use>: %w", err)
+	}
+	pc.uses = append(pc.uses, elem)
 	return elem, nil
 }
 

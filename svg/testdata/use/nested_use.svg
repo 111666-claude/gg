@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="32" height="16" viewBox="0 0 32 16">
+  <defs>
+    <path id="leaf" d="M1 8 L7 3 L7 13 Z"/>
+    <g id="branch">
+      <use xlink:href="#leaf" x="0" y="0"/>
+    </g>
+  </defs>
+  <use href="#branch" x="0"  y="0" fill="#3366CC" stroke="#CC3333" stroke-width="1"/>
+  <use href="#branch" x="16" y="0" fill="#33CC66"/>
+</svg>

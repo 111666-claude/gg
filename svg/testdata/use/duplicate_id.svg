@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <defs>
+    <circle id="dup" cx="4" cy="8" r="3"/>
+    <rect id="dup" x="9" y="5" width="6" height="6"/>
+  </defs>
+  <use href="#dup" x="0" y="0"/>
+</svg>
