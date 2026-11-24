@@ -70,10 +70,12 @@ type Backend struct {
 
 // Ensure Backend implements all required interfaces.
 var (
-	_ recording.Backend       = (*Backend)(nil)
-	_ recording.WriterBackend = (*Backend)(nil)
-	_ recording.FileBackend   = (*Backend)(nil)
-	_ recording.PixmapBackend = (*Backend)(nil)
+	_ recording.Backend          = (*Backend)(nil)
+	_ recording.WriterBackend    = (*Backend)(nil)
+	_ recording.FileBackend      = (*Backend)(nil)
+	_ recording.PixmapBackend    = (*Backend)(nil)
+	_ recording.BlendModeBackend = (*Backend)(nil)
+	_ recording.CapableBackend   = (*Backend)(nil)
 )
 
 // NewBackend creates a new raster backend at 1x scale.
@@ -204,45 +206,98 @@ func (b *Backend) FillRect(rect recording.Rect, brush recording.Brush) {
 }
 
 // DrawImage draws an image from source to destination rectangle.
-func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, _ recording.ImageOptions) {
-	if img == nil {
+//
+// Src and Dst are in recording world coordinates (the recorder pre-transforms
+// destination corners), so the CTM is reset to the persistent device scale
+// before calling DrawImageEx; DrawImageEx then maps world coordinates through
+// that CTM itself.
+func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, opts recording.ImageOptions) {
+	if img == nil || b.ctx == nil {
 		return
 	}
 
-	// Save current state
-	b.ctx.Push()
-	defer b.ctx.Pop()
+	b.applyDeviceScale()
 
-	// Calculate scale
-	srcW := src.Width()
-	srcH := src.Height()
+	buf := gg.ImageBufFromImage(img)
+
 	dstW := dst.Width()
 	dstH := dst.Height()
-
-	if srcW == 0 || srcH == 0 {
-		// Use full image bounds
+	if dstW <= 0 || dstH <= 0 {
 		bounds := img.Bounds()
-		srcW = float64(bounds.Dx())
-		srcH = float64(bounds.Dy())
+		dstW = float64(bounds.Dx())
+		dstH = float64(bounds.Dy())
 	}
 
-	scaleX := dstW / srcW
-	scaleY := dstH / srcH
+	drawOpts := gg.DrawImageOptions{
+		X:         dst.MinX,
+		Y:         dst.MinY,
+		DstWidth:  dstW,
+		DstHeight: dstH,
+		Opacity:   opts.Alpha,
+		BlendMode: gg.BlendNormal,
+	}
 
-	// Apply transform for scaling and positioning
-	b.ctx.Translate(dst.MinX, dst.MinY)
-	b.ctx.Scale(scaleX, scaleY)
-	b.ctx.Translate(-src.MinX, -src.MinY)
+	if srcW, srcH := src.Width(), src.Height(); srcW > 0 && srcH > 0 {
+		srcRect := image.Rect(
+			int(src.MinX), int(src.MinY),
+			int(src.MaxX), int(src.MaxY),
+		)
+		drawOpts.SrcRect = &srcRect
+	}
 
-	// Draw the image at origin (transform handles positioning)
-	// Note: gg.Context.DrawImage takes int coordinates
-	// We need to handle the source rect cropping if specified
-	// For now, draw the full image and let the transform handle it
-	bounds := img.Bounds()
-	b.ctx.DrawRectangle(float64(bounds.Min.X), float64(bounds.Min.Y),
-		float64(bounds.Dx()), float64(bounds.Dy()))
-	// TODO: Implement proper image drawing with cropping
-	// For now, use a simple approach
+	switch opts.Interpolation {
+	case recording.InterpolationNearest:
+		drawOpts.Interpolation = gg.InterpNearest
+	default:
+		drawOpts.Interpolation = gg.InterpBilinear
+	}
+
+	b.ctx.DrawImageEx(buf, drawOpts)
+}
+
+// SetBlendMode implements recording.BlendModeBackend. It forwards the blend
+// mode to the underlying gg.Context; Save/Restore preserves it via Push/Pop.
+func (b *Backend) SetBlendMode(mode recording.BlendMode) {
+	if b.ctx == nil {
+		return
+	}
+	b.ctx.SetBlendMode(gg.BlendMode(mode))
+}
+
+// Capabilities implements recording.CapableBackend with the honest feature
+// profile of the CPU raster backend.
+func (b *Backend) Capabilities() recording.Capabilities {
+	return RasterCapabilities()
+}
+
+// RasterCapabilities returns the capability declaration shared by all raster
+// backend instances.
+func RasterCapabilities() recording.Capabilities {
+	return recording.Capabilities{
+		Name: "raster",
+		Features: []recording.Capability{
+			recording.CapSaveRestore,
+			recording.CapSetTransform,
+			recording.CapFillPath,
+			recording.CapStrokePath,
+			recording.CapFillRect,
+			recording.CapRoundRect,
+			recording.CapClipPath,
+			recording.CapClipRoundRect,
+			recording.CapClearClip,
+			recording.CapDrawImage,
+			recording.CapDrawText,
+			recording.CapGradientLinear,
+			recording.CapGradientRadial,
+			recording.CapGradientSweep,
+			recording.CapBlendModes,
+		},
+		BlendModes: recording.AllBlendModes(),
+		Fallbacks: map[recording.Capability]string{
+			// StrokeTextCommand is lowered to DrawText by core playback.
+			recording.CapStrokeText: "playback_lowering:DrawText",
+		},
+	}
 }
 
 // DrawText draws text at the given position with the specified font face and brush.

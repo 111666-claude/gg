@@ -66,6 +66,9 @@ const (
 	CmdSetDash        // Set dash pattern
 	CmdSetFillRule    // Set fill rule
 	CmdSetAntiAlias   // Set anti-aliasing mode
+
+	// Compositing commands
+	CmdSetBlendMode // Set blend/composite mode (W3C/Porter-Duff)
 )
 
 // commandTypeNames maps CommandType values to their string representation.
@@ -92,6 +95,7 @@ var commandTypeNames = [...]string{
 	CmdSetDash:        "SetDash",
 	CmdSetFillRule:    "SetFillRule",
 	CmdSetAntiAlias:   "SetAntiAlias",
+	CmdSetBlendMode:   "SetBlendMode",
 }
 
 // String returns the string representation of a CommandType.

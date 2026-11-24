@@ -1,6 +1,7 @@
 package recording
 
 import (
+	"context"
 	"image"
 	"math"
 	"strings"
@@ -135,79 +136,11 @@ func (r *Recording) Resources() *ResourcePool {
 }
 
 // Playback replays the recording to the given backend.
+//
+// The implementation lives in playback_context.go alongside
+// PlaybackContext, which adds cancellation and located failure reporting.
 func (r *Recording) Playback(backend Backend) error {
-	// Initialize backend
-	if err := backend.Begin(r.width, r.height); err != nil {
-		return err
-	}
-
-	transform := Identity()
-	transformStack := make([]Matrix, 0, 8)
-
-	// Replay each command
-	for _, cmd := range r.commands {
-		switch c := cmd.(type) {
-		case SaveCommand:
-			transformStack = append(transformStack, transform)
-			backend.Save()
-		case RestoreCommand:
-			backend.Restore()
-			if len(transformStack) > 0 {
-				transform = transformStack[len(transformStack)-1]
-				transformStack = transformStack[:len(transformStack)-1]
-			}
-		case SetTransformCommand:
-			transform = c.Matrix
-			backend.SetTransform(c.Matrix)
-		case SetClipCommand:
-			path := r.resources.GetPath(c.Path)
-			setPlaybackClip(backend, path, c.Rule, transform)
-		case ClearClipCommand:
-			backend.ClearClip()
-		case ClipRoundRectCommand:
-			rrPath := buildClipRoundRectPath(c, transform)
-			setPlaybackClip(backend, rrPath, FillRuleNonZero, transform)
-		case FillPathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillPath(path, brush, c.Rule)
-		case StrokePathCommand:
-			path := r.resources.GetPath(c.Path)
-			brush := r.resources.GetBrush(c.Brush)
-			backend.StrokePath(path, brush, c.Stroke)
-		case FillRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.FillRect(c.Rect, brush)
-		case StrokeRectCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			path := gg.BuildPath().Rect(c.Rect.MinX, c.Rect.MinY, c.Rect.Width(), c.Rect.Height()).Build()
-			// StrokeRectCommand stores world-space bounds. Isolate the identity
-			// transform so backends do not apply the recording transform twice,
-			// then restore their complete graphics state for later commands.
-			backend.Save()
-			backend.SetTransform(Identity())
-			backend.StrokePath(path, brush, c.Stroke)
-			backend.Restore()
-		case DrawImageCommand:
-			img := r.resources.GetImage(c.Image)
-			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
-		case DrawTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		case StrokeTextCommand:
-			brush := r.resources.GetBrush(c.Brush)
-			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
-		// Style commands are handled by the backend's internal state
-		// during the actual drawing operations
-		case SetFillStyleCommand, SetStrokeStyleCommand,
-			SetLineWidthCommand, SetLineCapCommand, SetLineJoinCommand,
-			SetMiterLimitCommand, SetDashCommand, SetFillRuleCommand:
-			// These are state commands that were recorded but the actual
-			// style is captured in the drawing commands themselves
-		}
-	}
-
-	return backend.End()
+	return r.PlaybackContext(context.Background(), backend)
 }
 
 // setPlaybackClip applies a world-space clip without disturbing the backend's
