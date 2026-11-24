@@ -18,6 +18,47 @@ type Document struct {
 
 	// Elements contains the top-level SVG elements.
 	Elements []Element
+
+	// GradientList contains every resolved linear/radial gradient, in document
+	// order. Gradients remain available even when [Document.GradientErrors]
+	// reports problems; malformed gradients carry deterministic fallbacks.
+	GradientList []*Gradient
+
+	// gradientByID indexes GradientList by its id attribute.
+	gradientByID map[string]*Gradient
+
+	// gradientErrors collects every path-bearing gradient validation issue.
+	gradientErrors []*GradientError
+}
+
+// Gradient returns the resolved gradient with the given id and true, or nil
+// and false when no gradient with that id exists.
+func (d *Document) Gradient(id string) (*Gradient, bool) {
+	if d == nil || d.gradientByID == nil {
+		return nil, false
+	}
+	g, ok := d.gradientByID[id]
+	return g, ok
+}
+
+// Gradients returns all resolved gradients in document order.
+func (d *Document) Gradients() []*Gradient {
+	if d == nil {
+		return nil
+	}
+	return d.GradientList
+}
+
+// GradientErrors returns the path-bearing validation issues collected while
+// parsing gradients and paint references. Each item is also a regular error.
+// Rendering never panics on these cases: the affected paint degrades to the
+// documented fallback (clamped/normalized stops, solid fallback color, or a
+// transparent paint).
+func (d *Document) GradientErrors() []*GradientError {
+	if d == nil {
+		return nil
+	}
+	return d.gradientErrors
 }
 
 // ViewBox represents the SVG viewBox attribute.
@@ -27,10 +68,13 @@ type ViewBox struct {
 
 // Attrs holds common SVG presentation attributes shared by all elements.
 type Attrs struct {
-	Fill          string  // "#hex", "none", "rgb(...)", named color, ""
+	// Path is the best-effort XPath-like location of the element in the
+	// source document, used in gradient and reference error messages.
+	Path          string
+	Fill          string  // "#hex", "none", "rgb(...)", named color, "url(#id)", ""
 	FillRule      string  // "evenodd", "nonzero", ""
 	FillOpacity   float64 // 0-1, default 1
-	Stroke        string  // "#hex", "none", "rgb(...)", named color, ""
+	Stroke        string  // "#hex", "none", "rgb(...)", named color, "url(#id)", ""
 	StrokeWidth   float64 // default 1
 	StrokeCap     string  // "round", "square", "butt", ""
 	StrokeJoin    string  // "round", "bevel", "miter", ""

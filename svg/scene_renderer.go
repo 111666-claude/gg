@@ -33,6 +33,8 @@ func (d *Document) renderToSceneInternal(
 		override = *overrideColor
 	}
 	state := &renderState{
+		doc:           d,
+		viewBox:       d.ViewBox,
 		overrideColor: override,
 		parentFill:    d.RootFill,
 		opacity:       1,

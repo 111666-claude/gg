@@ -11,23 +11,31 @@ import (
 
 // Render parses SVG XML data and renders it to an RGBA image at the specified size.
 // The SVG viewBox is scaled to fit the target width and height.
+//
+// Gradient validation problems do not prevent rendering: when the returned
+// error is a joined collection of [*GradientError], the image is still
+// produced using deterministic fallbacks. Callers that want strict rejection
+// can inspect the error; callers that want best-effort rendering may use the
+// image and ignore it.
 func Render(data []byte, width, height int) (*image.RGBA, error) {
 	doc, err := Parse(data)
-	if err != nil {
+	if doc == nil {
 		return nil, err
 	}
-	return doc.Render(width, height), nil
+	return doc.Render(width, height), err
 }
 
 // RenderWithColor parses SVG XML data and renders it with all fill and stroke
 // colors replaced by the given color. This is useful for theming icon SVGs.
 // Colors set to "none" are preserved (transparent areas stay transparent).
+//
+// See [Render] for the gradient-validation error contract.
 func RenderWithColor(data []byte, width, height int, c color.Color) (*image.RGBA, error) {
 	doc, err := Parse(data)
-	if err != nil {
+	if doc == nil {
 		return nil, err
 	}
-	return doc.RenderWithColor(width, height, c), nil
+	return doc.RenderWithColor(width, height, c), err
 }
 
 // Render renders the document to an RGBA image at the specified size.
@@ -82,6 +90,8 @@ func (d *Document) renderInternal(dc *gg.Context, x, y, width, height float64, o
 	}
 
 	state := &renderState{
+		doc:           d,
+		viewBox:       d.ViewBox,
 		overrideColor: overrideColor,
 		parentFill:    d.RootFill,
 		opacity:       1,

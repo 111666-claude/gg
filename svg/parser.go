@@ -13,12 +13,19 @@ import (
 //
 // Only the SVG subset needed for icon rendering is supported.
 // Unsupported elements are silently skipped.
+//
+// When gradient markup contains a validation problem (dangling reference,
+// cycle, negative radius, non-finite or oversized parameters, ...), Parse
+// returns a joined error whose items are [*GradientError] carrying the
+// source element path. The returned Document is still non-nil and renders
+// with deterministic fallbacks; callers may ignore the error and render it.
 func Parse(data []byte) (*Document, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 
 	doc := &Document{
 		ViewBox: ViewBox{Width: 16, Height: 16}, // sensible default
 	}
+	ps := &parseState{allIDs: make(map[string]bool)}
 
 	// Find the root <svg> element.
 	for {
@@ -31,14 +38,42 @@ func Parse(data []byte) (*Document, error) {
 				return nil, err
 			}
 			// Parse children.
-			children, err := parseChildren(decoder)
+			children, err := parseChildren(decoder, ps, "/svg")
 			if err != nil {
 				return nil, err
 			}
 			doc.Elements = children
-			return doc, nil
+			gradErr := finalizeGradients(doc, ps)
+			return doc, gradErr
 		}
 	}
+}
+
+// parseState carries document-wide parse collections through recursion.
+type parseState struct {
+	defs   []*gradientDef
+	allIDs map[string]bool
+}
+
+// elementPath builds an XPath-like location for a child element. Elements with
+// an id use an @id predicate (stable and recognizable); siblings without id
+// get a 1-based positional index among same-named siblings.
+func elementPath(parent, local string, se xml.StartElement, sameTagIndex int) string {
+	id := attrLocal(se, "id")
+	base := parent + "/" + local
+	if id != "" {
+		return fmt.Sprintf(`%s[@id=%q]`, base, id)
+	}
+	return fmt.Sprintf("%s[%d]", base, sameTagIndex)
+}
+
+func attrLocal(se xml.StartElement, name string) string {
+	for _, a := range se.Attr {
+		if a.Name.Local == name {
+			return a.Value
+		}
+	}
+	return ""
 }
 
 // parseSVGRoot extracts viewBox, width, height from the <svg> element attributes.
@@ -116,8 +151,9 @@ func parseDimension(s string) (float64, error) {
 }
 
 // parseChildren parses child elements until the matching end element is found.
-func parseChildren(decoder *xml.Decoder) ([]Element, error) {
+func parseChildren(decoder *xml.Decoder, ps *parseState, parentPath string) ([]Element, error) {
 	var elements []Element
+	tagCounts := make(map[string]int)
 
 	for {
 		tok, err := decoder.Token()
@@ -127,11 +163,17 @@ func parseChildren(decoder *xml.Decoder) ([]Element, error) {
 
 		switch t := tok.(type) {
 		case xml.StartElement:
-			elem, err := parseElement(decoder, t)
+			tagCounts[t.Name.Local]++
+			if id := attrLocal(t, "id"); id != "" {
+				ps.allIDs[id] = true
+			}
+			path := elementPath(parentPath, t.Name.Local, t, tagCounts[t.Name.Local])
+			elem, err := parseElement(decoder, ps, t, path)
 			if err != nil {
 				return nil, err
 			}
 			if elem != nil {
+				elem.attrs().Path = path
 				elements = append(elements, elem)
 			}
 
@@ -142,8 +184,9 @@ func parseChildren(decoder *xml.Decoder) ([]Element, error) {
 }
 
 // parseElement parses a single SVG element from a start element.
-// Returns nil for unsupported elements (silently skipped).
-func parseElement(decoder *xml.Decoder, se xml.StartElement) (Element, error) {
+// Returns nil for unsupported/definition elements (silently skipped or
+// registered as paint servers).
+func parseElement(decoder *xml.Decoder, ps *parseState, se xml.StartElement, path string) (Element, error) {
 	switch se.Name.Local {
 	case "path":
 		return parsePathElement(decoder, se)
@@ -160,14 +203,114 @@ func parseElement(decoder *xml.Decoder, se xml.StartElement) (Element, error) {
 	case "polyline":
 		return parsePolylineElement(decoder, se)
 	case "g":
-		return parseGroupElement(decoder, se)
+		return parseGroupElement(decoder, ps, se, path)
+	case "defs":
+		// Definitions never render directly, but their gradients must be
+		// registered and any nested supported elements parsed for traversal.
+		if _, err := parseChildren(decoder, ps, path); err != nil {
+			return nil, err
+		}
+		return nil, nil //nolint:nilnil // defs itself is not a render node
+	case "linearGradient":
+		return parseGradientElement(decoder, ps, se, path, LinearGradient)
+	case "radialGradient":
+		return parseGradientElement(decoder, ps, se, path, RadialGradient)
 	default:
-		// Skip unsupported elements (defs, clipPath, use, text, etc.).
+		// Skip unsupported elements (clipPath, use, text, filter, etc.).
 		if err := decoder.Skip(); err != nil {
 			return nil, fmt.Errorf("svg: error skipping <%s>: %w", se.Name.Local, err)
 		}
 		return nil, nil //nolint:nilnil // nil element means "skip this element"
 	}
+}
+
+// parseGradientElement parses <linearGradient>/<radialGradient> and their
+// <stop> children, registering the raw definition in ps. The gradient itself
+// is not a render Element.
+func parseGradientElement(decoder *xml.Decoder, ps *parseState, se xml.StartElement, path string, kind GradientKind) (Element, error) {
+	def := &gradientDef{
+		id:    attrLocal(se, "id"),
+		path:  path,
+		kind:  kind,
+		attrs: make(map[string]string, len(se.Attr)),
+	}
+	for _, a := range se.Attr {
+		key := a.Name.Local
+		def.attrs[key] = a.Value
+		// Expose namespaced xlink:href under both keys for inheritance.
+		if key == "href" && a.Name.Space != "" {
+			def.attrs["xlink:href"] = a.Value
+		}
+	}
+
+	stopIndex := 0
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("svg: error reading <%s>: %w", kind, err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "stop" {
+				stopIndex++
+				sp := fmt.Sprintf("%s/stop[%d]", path, stopIndex)
+				sd := gradientStopDef{path: sp}
+				style := ""
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "offset":
+						sd.offsetRaw = a.Value
+					case "stop-color":
+						sd.colorRaw = a.Value
+					case "stop-opacity":
+						sd.opacityRaw = a.Value
+					case "style":
+						style = a.Value
+					}
+				}
+				// Inline style wins over presentation attributes.
+				if style != "" {
+					decls := parseStyleDeclarations(style)
+					if v, ok := decls["stop-color"]; ok {
+						sd.colorRaw = v
+					}
+					if v, ok := decls["stop-opacity"]; ok {
+						sd.opacityRaw = v
+					}
+					if v, ok := decls["offset"]; ok {
+						sd.offsetRaw = v
+					}
+				}
+				def.stops = append(def.stops, sd)
+			}
+			// Consume the whole child element (stop is empty in practice;
+			// other children are ignored).
+			if err := decoder.Skip(); err != nil {
+				return nil, fmt.Errorf("svg: error reading child of <%s>: %w", kind, err)
+			}
+		case xml.EndElement:
+			ps.defs = append(ps.defs, def)
+			return nil, nil //nolint:nilnil // paint servers are not render nodes
+		}
+	}
+}
+
+// parseStyleDeclarations parses a minimal inline CSS declaration list
+// ("fill: url(#g); fill-opacity: 0.5") into a lower-cased property map.
+func parseStyleDeclarations(style string) map[string]string {
+	out := make(map[string]string)
+	for _, decl := range strings.Split(style, ";") {
+		kv := strings.SplitN(decl, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		val := strings.TrimSpace(kv[1])
+		if key != "" {
+			out[key] = val
+		}
+	}
+	return out
 }
 
 // parseAttrs extracts common SVG presentation attributes from an element.
@@ -178,6 +321,7 @@ func parseAttrs(se xml.StartElement) Attrs {
 		StrokeWidth:   1.0,
 		Opacity:       1.0,
 	}
+	var style string
 	for _, attr := range se.Attr {
 		switch attr.Name.Local {
 		case "fill":
@@ -210,6 +354,39 @@ func parseAttrs(se xml.StartElement) Attrs {
 			a.Transform = attr.Value
 		case "clip-rule":
 			a.ClipRule = attr.Value
+		case "style":
+			style = attr.Value
+		}
+	}
+
+	// Inline style declarations override presentation attributes (CSS rule).
+	if style != "" {
+		decls := parseStyleDeclarations(style)
+		if v, ok := decls["fill"]; ok {
+			a.Fill = v
+		}
+		if v, ok := decls["stroke"]; ok {
+			a.Stroke = v
+		}
+		if v, ok := decls["fill-opacity"]; ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				a.FillOpacity = f
+			}
+		}
+		if v, ok := decls["stroke-opacity"]; ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				a.StrokeOpacity = f
+			}
+		}
+		if v, ok := decls["opacity"]; ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				a.Opacity = f
+			}
+		}
+		if v, ok := decls["stroke-width"]; ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				a.StrokeWidth = f
+			}
 		}
 	}
 	return a
@@ -352,9 +529,9 @@ func parsePolylineElement(decoder *xml.Decoder, se xml.StartElement) (*PolylineE
 }
 
 // parseGroupElement parses a <g> element and its children recursively.
-func parseGroupElement(decoder *xml.Decoder, se xml.StartElement) (*GroupElement, error) {
+func parseGroupElement(decoder *xml.Decoder, ps *parseState, se xml.StartElement, path string) (*GroupElement, error) {
 	elem := &GroupElement{Attrs: parseAttrs(se)}
-	children, err := parseChildren(decoder)
+	children, err := parseChildren(decoder, ps, path)
 	if err != nil {
 		return nil, err
 	}

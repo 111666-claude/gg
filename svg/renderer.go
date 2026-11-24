@@ -1,6 +1,8 @@
 package svg
 
 import (
+	"math"
+
 	"github.com/gogpu/gg"
 	"image/color"
 )
@@ -8,6 +10,8 @@ import (
 // renderState is shared by immediate and retained traversal. Matrix is the
 // complete logical transform at the current nesting level.
 type renderState struct {
+	doc           *Document
+	viewBox       ViewBox
 	overrideColor color.Color
 	parentFill    string
 	parentStroke  string
@@ -104,11 +108,35 @@ func renderGeometry(dc *gg.Context, path *gg.Path, attrs *Attrs, state *renderSt
 		return
 	}
 
+	// Resolve gradient paint servers (fill/stroke="url(#id)"). The brush is
+	// sampled in device space, so it needs the complete CTM and the local
+	// object bounding box for objectBoundingBox units.
+	bounds, _ := pathFloatBounds(path)
+	var fillBrush, strokeBrush gg.Brush
+	if state.overrideColor == nil && state.doc != nil {
+		if ref, _, isRef := parsePaintRef(resolveFill(attrs, state)); isRef {
+			if g, ok := state.doc.Gradient(ref); ok {
+				alpha := clampOpacity(attrs.FillOpacity * attrs.Opacity * state.opacity)
+				fillBrush = buildGradientBrush(g, complete, bounds, state.viewBox, alpha)
+			}
+		}
+		if ref, _, isRef := parsePaintRef(resolveStroke(attrs, state)); isRef {
+			if g, ok := state.doc.Gradient(ref); ok {
+				alpha := clampOpacity(attrs.StrokeOpacity * attrs.Opacity * state.opacity)
+				strokeBrush = buildGradientBrush(g, complete, bounds, state.viewBox, alpha)
+			}
+		}
+	}
+
 	dc.Push()
 	dc.Transform(local)
 	if style.fill.present {
 		dc.SetFillRule(style.fill.rule)
-		setResolvedColor(dc, style.fill.color)
+		if fillBrush != nil {
+			dc.SetFillBrush(fillBrush)
+		} else {
+			setResolvedColor(dc, style.fill.color)
+		}
 		dc.DrawPath(path)
 		_ = dc.Fill()
 	}
@@ -118,7 +146,11 @@ func renderGeometry(dc *gg.Context, path *gg.Path, attrs *Attrs, state *renderSt
 		dc.SetLineWidth(style.stroke.width)
 		dc.SetLineCap(style.stroke.cap)
 		dc.SetLineJoin(style.stroke.join)
-		setResolvedColor(dc, style.stroke.color)
+		if strokeBrush != nil {
+			dc.SetStrokeBrush(strokeBrush)
+		} else {
+			setResolvedColor(dc, style.stroke.color)
+		}
 		dc.DrawPath(strokePath)
 		_ = dc.Stroke()
 	}
@@ -178,7 +210,62 @@ func resolveStyle(attrs *Attrs, state *renderState) resolvedStyle {
 		attrs.StrokeOpacity*attrs.Opacity*state.opacity)
 	style.stroke.color = strokeColor
 	style.stroke.present = style.stroke.present && strokeOK
+
+	// Valid gradient paint servers must stay "present" even though the plain
+	// color parser cannot understand url(#id). Give the retained/scene path a
+	// representative solid color; the immediate renderer installs the real
+	// sampling brush afterwards. A resolved gradient with no stops paints
+	// nothing (transparent), matching the SVG degenerate case.
+	if state.overrideColor == nil && state.doc != nil {
+		if id, _, isRef := parsePaintRef(fillString); isRef {
+			if g, ok := state.doc.Gradient(id); ok {
+				if len(g.Stops) == 0 {
+					style.fill.present = false
+				} else {
+					style.fill.present = true
+					if c, ok := representativeGradientColor(g); ok {
+						c.A = clampOpacity(c.A * attrs.FillOpacity * attrs.Opacity * state.opacity)
+						style.fill.color = c
+					}
+				}
+			}
+		}
+		if id, _, isRef := parsePaintRef(strokeString); isRef {
+			if g, ok := state.doc.Gradient(id); ok {
+				if len(g.Stops) == 0 {
+					style.stroke.present = false
+				} else {
+					style.stroke.present = true
+					if c, ok := representativeGradientColor(g); ok {
+						c.A = clampOpacity(c.A * attrs.StrokeOpacity * attrs.Opacity * state.opacity)
+						style.stroke.color = c
+					}
+				}
+			}
+		}
+	}
 	return style
+}
+
+// representativeGradientColor picks a stable solid stand-in for a gradient
+// when only solid paints are available (retained scene encoding). It uses the
+// final stop, matching the degenerate-gradient flat color.
+func representativeGradientColor(g *Gradient) (gg.RGBA, bool) {
+	if g == nil || len(g.Stops) == 0 {
+		return gg.RGBA{}, false
+	}
+	return g.Stops[len(g.Stops)-1].Color, true
+}
+
+// clampOpacity clamps a composed opacity product to [0,1].
+func clampOpacity(v float64) float64 {
+	if v < 0 || math.IsNaN(v) {
+		return 0
+	}
+	if v > 1 || math.IsInf(v, 1) {
+		return 1
+	}
+	return v
 }
 
 func resolveFill(attrs *Attrs, state *renderState) string {
