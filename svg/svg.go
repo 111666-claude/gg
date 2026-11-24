@@ -89,6 +89,7 @@ func (d *Document) renderInternal(dc *gg.Context, x, y, width, height float64, o
 		targetWidth:   width,
 		targetHeight:  height,
 		deviceScale:   dc.DeviceScale(),
+		clips:         d.ClipPaths,
 	}
 
 	renderElements(dc, d.Elements, state)

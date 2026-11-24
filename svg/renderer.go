@@ -1,8 +1,10 @@
 package svg
 
 import (
-	"github.com/gogpu/gg"
 	"image/color"
+	"strings"
+
+	"github.com/gogpu/gg"
 )
 
 // renderState is shared by immediate and retained traversal. Matrix is the
@@ -17,6 +19,7 @@ type renderState struct {
 	targetHeight  float64
 	deviceScale   float64
 	outerMatrix   gg.Matrix
+	clips         map[string]*ClipPath
 }
 
 type resolvedFill struct {
@@ -106,6 +109,12 @@ func renderGeometry(dc *gg.Context, path *gg.Path, attrs *Attrs, state *renderSt
 
 	dc.Push()
 	dc.Transform(local)
+	// Apply clip-path references in the element's local user space (the
+	// current dc space after Transform(local)). Clip stacks intersect, so
+	// ancestor group clips remain in force.
+	if strings.TrimSpace(attrs.ClipPathRef) != "" {
+		applyAttrClips(dc, state.clips, attrs, pathFloatBounds(path))
+	}
 	if style.fill.present {
 		dc.SetFillRule(style.fill.rule)
 		setResolvedColor(dc, style.fill.color)
@@ -139,6 +148,11 @@ func renderGroup(dc *gg.Context, group *GroupElement, state *renderState) {
 
 	dc.Push()
 	dc.Transform(local)
+	// A clip-path on a group clips every descendant; the group bbox backs
+	// objectBoundingBox units.
+	if strings.TrimSpace(group.Attrs.ClipPathRef) != "" {
+		applyAttrClips(dc, state.clips, &group.Attrs, groupLocalBox(group))
+	}
 	renderElements(dc, group.Children, &child)
 	dc.Pop()
 }

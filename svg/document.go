@@ -18,6 +18,53 @@ type Document struct {
 
 	// Elements contains the top-level SVG elements.
 	Elements []Element
+
+	// ClipPaths contains the reusable <clipPath> definitions keyed by their
+	// id attribute. The definitions are fully parsed and validated by Parse
+	// and must be treated as read-only; the same Document can be rendered at
+	// arbitrary sizes. ClipPaths never participate in Elements ordering, so
+	// unreferenced definitions leave the rendered element order unchanged.
+	ClipPaths map[string]*ClipPath
+}
+
+// ClipPath is a parsed, reusable SVG <clipPath> definition.
+//
+// Children holds the clip geometry (path, rect, circle, ellipse, line,
+// polygon, polyline and nested groups). Geometry is interpreted according to
+// Units and the definition's own Attrs.Transform. A clipPath may itself
+// reference another clipPath through Attrs.ClipPathRef; the two regions then
+// intersect.
+type ClipPath struct {
+	// Attrs carries the clipPath element's presentation attributes,
+	// including Transform, ClipRule and ClipPathRef.
+	Attrs Attrs
+
+	// ID is the clipPath element's id attribute (map key).
+	ID string
+
+	// Units is the parsed clipPathUnits value:
+	// "userSpaceOnUse" (default) or "objectBoundingBox".
+	Units string
+
+	// Children are the parsed geometry/group children.
+	Children []Element
+
+	// ElementPath is the slash-separated document path of the definition,
+	// for example "svg/defs/clipPath#rounded". Used in parse errors.
+	ElementPath string
+}
+
+// ClipPathElement is an alias for [ClipPath], matching the *Element naming
+// convention used by the other parsed SVG nodes.
+type ClipPathElement = ClipPath
+
+// LookupClipPath returns the read-only clipPath definition for id.
+func (d *Document) LookupClipPath(id string) (*ClipPath, bool) {
+	if d == nil || d.ClipPaths == nil {
+		return nil, false
+	}
+	cp, ok := d.ClipPaths[id]
+	return cp, ok
 }
 
 // ViewBox represents the SVG viewBox attribute.
@@ -27,6 +74,7 @@ type ViewBox struct {
 
 // Attrs holds common SVG presentation attributes shared by all elements.
 type Attrs struct {
+	ID            string  // id attribute, used for clip-path references
 	Fill          string  // "#hex", "none", "rgb(...)", named color, ""
 	FillRule      string  // "evenodd", "nonzero", ""
 	FillOpacity   float64 // 0-1, default 1
@@ -38,6 +86,10 @@ type Attrs struct {
 	Opacity       float64 // element-level opacity, default 1
 	Transform     string  // raw transform string
 	ClipRule      string  // "evenodd", "nonzero", ""
+	ClipPathRef   string  // raw clip-path attribute value, e.g. "url(#id)"
+
+	// elementPath is the parse-time document path used in validation errors.
+	elementPath string
 }
 
 // Element is the interface implemented by all SVG element types.

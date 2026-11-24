@@ -3,6 +3,7 @@ package svg
 import (
 	"image/color"
 	"math"
+	"strings"
 
 	"github.com/gogpu/gg"
 	"github.com/gogpu/gg/scene"
@@ -41,6 +42,7 @@ func (d *Document) renderToSceneInternal(
 		targetHeight:  float64(height) * outerScale,
 		deviceScale:   1,
 		outerMatrix:   outer,
+		clips:         d.ClipPaths,
 	}
 	renderSceneElements(target, d.Elements, state)
 }
@@ -125,7 +127,14 @@ func renderSceneGroup(target *scene.Scene, group *GroupElement, state *renderSta
 	if layered {
 		target.PushLayer(scene.BlendNormal, float32(group.Attrs.Opacity), nil)
 	}
+	clipPops := 0
+	if strings.TrimSpace(group.Attrs.ClipPathRef) != "" {
+		clipPops = applySceneAttrClips(target, state.clips, &group.Attrs, groupLocalBox(group), child.matrix)
+	}
 	renderSceneElements(target, group.Children, &child)
+	for i := 0; i < clipPops; i++ {
+		target.PopClip()
+	}
 	if layered {
 		target.PopLayer()
 	}
@@ -146,6 +155,10 @@ func renderSceneGeometry(
 		style.fill.present = false
 	}
 	transform := scene.AffineFromMatrix(complete)
+	clipPops := 0
+	if strings.TrimSpace(attrs.ClipPathRef) != "" {
+		clipPops = applySceneAttrClips(target, state.clips, attrs, pathFloatBounds(path), complete)
+	}
 	if style.fill.present {
 		fillRule := scene.FillNonZero
 		if style.fill.rule == gg.FillRuleEvenOdd {
@@ -171,6 +184,9 @@ func renderSceneGeometry(
 			Join:       sceneLineJoin(style.stroke.join),
 		}
 		target.Stroke(stroke, transform, scene.SolidBrush(style.stroke.color), strokeShape)
+	}
+	for i := 0; i < clipPops; i++ {
+		target.PopClip()
 	}
 }
 
