@@ -1,6 +1,8 @@
 package gg
 
 import (
+	"math"
+
 	intImage "github.com/gogpu/gg/internal/image"
 )
 
@@ -47,11 +49,13 @@ func newLayerStack() *layerStack {
 //	dc.Fill()
 //	dc.PopLayer() // Composite circle onto canvas with multiply blend at 50% opacity
 func (c *Context) PushLayer(blendMode BlendMode, opacity float64) {
-	// Clamp opacity to valid range
-	if opacity < 0 {
+	// Sanitize opacity onto [0, 1] with explicit non-finite rules so the
+	// context-level path matches the scene renderer's layer-alpha cleaning:
+	// NaN -> 0 (fail invisible), +Inf -> 1, -Inf -> 0, range clamped.
+	if math.IsNaN(opacity) || math.IsInf(opacity, -1) || opacity < 0 {
 		opacity = 0
 	}
-	if opacity > 1 {
+	if math.IsInf(opacity, 1) || opacity > 1 {
 		opacity = 1
 	}
 

@@ -322,17 +322,19 @@ func (s *Scene) PushLayer(blend BlendMode, alpha float32, clip Shape) {
 		layer.Encoding.Reset()
 	}
 
-	// Encode push layer in parent
-	parentEnc := s.currentEncoding()
-	parentEnc.EncodePushLayer(blend, clampedAlpha)
+	// The push marker is recorded in THIS layer's own encoding rather than
+	// the parent's. On PopLayer the whole subtree (push, contents, pop) is
+	// appended to the parent as one balanced unit, which keeps nested
+	// push/pop markers correctly paired after flattening.
+	layer.Encoding.EncodePushLayer(blend, clampedAlpha)
 
-	// If there's a clip, encode it
+	// If there's a clip, encode it as part of the layer subtree.
 	if clip != nil {
 		path := s.shapeToPath(clip)
 		if path != nil && !path.IsEmpty() {
-			s.encodeScenePath(parentEnc, path)
+			s.encodeScenePath(layer.Encoding, path)
 			s.pathPool.Put(path)
-			parentEnc.EncodeBeginClip()
+			layer.Encoding.EncodeBeginClip()
 		}
 	}
 
@@ -355,23 +357,25 @@ func (s *Scene) PopLayer() bool {
 	// Get parent encoding
 	parentEnc := s.currentEncoding()
 
-	// If layer had content, append it to parent
+	// If the layer carried a clip, close it inside the layer's own subtree.
+	if layer.Clip != nil {
+		layer.Encoding.EncodeEndClip()
+	}
+
+	// Close the layer inside its own subtree, then append the complete,
+	// balanced [push ... pop] unit to the parent.
+	layer.Encoding.EncodePopLayer()
 	if layer.Encoding != nil && !layer.Encoding.IsEmpty() {
 		parentEnc.Append(layer.Encoding)
 	}
 
-	// If layer had a clip, end it
-	if layer.Clip != nil {
-		parentEnc.EncodeEndClip()
-	}
-
-	// Encode pop layer
-	parentEnc.EncodePopLayer()
-
 	// Update parent bounds
 	s.layerStack.Top().UpdateBounds(layer.Bounds)
 
-	// Return layer to pool
+	// Detach the appended encoding before the layer re-enters the pool:
+	// the parent now owns that backing memory, and a pooled reuse must not
+	// overwrite it. The layer gets a fresh empty encoding for next time.
+	layer.detachEncoding()
 	s.layerStack.ReleaseLayer(layer)
 
 	s.version++

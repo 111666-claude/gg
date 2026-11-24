@@ -819,7 +819,10 @@ func (e *Encoding) AppendWithImages(other *Encoding, imageOffset uint32) {
 		return
 	}
 
-	// Calculate brush index offset for the appended encoding
+	// Calculate brush index offset for the appended encoding.
+	// Child brush indices are relative to the child's own brushes array
+	// (which starts at 0); this is the base at which that array is
+	// concatenated onto e.brushes below.
 	//nolint:gosec // brush slice length is bounded, overflow not possible in practice
 	brushOffset := uint32(len(e.brushes))
 

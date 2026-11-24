@@ -163,6 +163,10 @@ func (r *GPUSceneRenderer) RenderScene(scene *Scene) error { //nolint:gocyclo,cy
 
 		case TagPushLayer:
 			blend, alpha := dec.PushLayer()
+			// Apply the same cleaning rules as the CPU tile renderer so the
+			// two paths produce identical pixels for NaN/Inf/out-of-range
+			// layer alpha.
+			alpha = sanitizeLayerAlpha(alpha)
 			dc.PushLayer(gg.BlendMode(blend), float64(alpha))
 
 		case TagPopLayer:

@@ -1,5 +1,7 @@
 package scene
 
+import "math"
+
 // LayerKind identifies the type of compositing layer.
 type LayerKind uint8
 
@@ -126,6 +128,23 @@ func (ls *LayerState) Reset() {
 	ls.ClipStackDepth = 0
 }
 
+// detachEncoding replaces the layer's encoding with a fresh, empty one and
+// returns the previous encoding.
+//
+// This is required when a layer subtree has been appended into its parent's
+// encoding: Encoding.Append copies the slice headers, so the parent and the
+// layer keep sharing the same backing arrays. Encoding.Reset only truncates
+// the lengths without freeing those arrays — reusing the layer (via the
+// pool) would then append new bytes over the parent's live data, silently
+// corrupting earlier commands (observed as layer alpha being overwritten).
+// Handing back a detached encoding keeps the pooled layer reusable while the
+// parent retains its own copy.
+func (ls *LayerState) detachEncoding() *Encoding {
+	old := ls.Encoding
+	ls.Encoding = NewEncoding()
+	return old
+}
+
 // UpdateBounds expands the layer bounds to include the given rectangle.
 func (ls *LayerState) UpdateBounds(r Rect) {
 	ls.Bounds = ls.Bounds.Union(r)
@@ -144,15 +163,37 @@ func (ls *LayerState) HasClip() bool {
 	return ls.Clip != nil
 }
 
-// clampAlpha clamps alpha to [0, 1] range.
-func clampAlpha(alpha float32) float32 {
-	if alpha < 0 {
+// sanitizeLayerAlpha maps any float32 layer alpha onto the closed range [0, 1].
+//
+// Explicit cleaning rules (applied identically by the CPU tile renderer, the
+// GPU/fallback path and the scene encoder so backends cannot diverge):
+//   - NaN            -> 0 (non-finite input is invalid; fail invisible, never
+//     with an uncontrolled opacity)
+//   - +Inf           -> 1 (maximally opaque)
+//   - -Inf or < 0    -> 0 (fully transparent)
+//   - > 1            -> 1 (fully opaque)
+//   - finite [0, 1]  -> unchanged (0 and 1 included, exact fast paths)
+//
+// NaN must be handled before the range comparisons: both NaN < 0 and
+// NaN > 1 evaluate false, so a plain clamp would pass NaN through.
+func sanitizeLayerAlpha(alpha float32) float32 {
+	if math.IsNaN(float64(alpha)) {
 		return 0
 	}
-	if alpha > 1 {
+	if math.IsInf(float64(alpha), 1) || alpha > 1 {
 		return 1
 	}
+	if math.IsInf(float64(alpha), -1) || alpha < 0 {
+		return 0
+	}
 	return alpha
+}
+
+// clampAlpha clamps alpha to [0, 1] range, cleaning NaN and Inf values.
+// Retained as the named entry point used by layer construction; see
+// sanitizeLayerAlpha for the per-input rules.
+func clampAlpha(alpha float32) float32 {
+	return sanitizeLayerAlpha(alpha)
 }
 
 // LayerStack manages a stack of active layers.

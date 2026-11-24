@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scene` CPU tile renderer now applies per-layer alpha** — `TagPushLayer`/`TagPopLayer` were no-ops in the CPU
+  tile path, so a translucent layer rendered fully opaque and stacking order changed the result. A layer now renders
+  into an isolated transparent pixmap; on pop its alpha is applied exactly once to all four premultiplied channels
+  (keeping transparent and anti-aliased edges valid) and the result is composited onto the parent with the layer's
+  blend mode. Nested layers, layer clips and filter-expanded/unequal parent-child sizes are handled without
+  cross-row writes. Layer alpha is sanitized identically on every backend: `NaN` and negative/`-Inf` become 0,
+  values above 1 and `+Inf` become 1. The scene encoder also keeps nested push/pop markers balanced after
+  flattening and detaches appended layer encodings before pool reuse, fixing a backing-array alias that could
+  overwrite an earlier layer's data.
 - **`ggcanvas.New` keeps one canvas through a window resize** — v0.52.7 said `New` reuses the canvas instead of
   allocating one per frame, but its cache key included the requested size: an application that calls `New` every
   frame with the window's size kept one more canvas, with its pixmap and texture, for every size it passed through

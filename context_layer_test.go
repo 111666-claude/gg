@@ -1,6 +1,7 @@
 package gg
 
 import (
+	"math"
 	"testing"
 )
 
@@ -207,6 +208,31 @@ func TestLayerOpacityClamping(t *testing.T) {
 	dc.PushLayer(BlendNormal, 0.7)
 	if dc.layerStack.layers[0].opacity != 0.7 {
 		t.Errorf("Expected opacity 0.7, got %f", dc.layerStack.layers[0].opacity)
+	}
+	dc.PopLayer()
+}
+
+// TestLayerOpacitySanitization verifies the explicit non-finite cleaning
+// rules match scene.sanitizeLayerAlpha so the context and scene backends
+// agree: NaN -> 0, -Inf -> 0, +Inf -> 1.
+func TestLayerOpacitySanitization(t *testing.T) {
+	dc := NewContext(100, 100)
+
+	dc.PushLayer(BlendNormal, math.NaN())
+	if dc.layerStack.layers[0].opacity != 0 {
+		t.Errorf("NaN opacity: got %f, want 0", dc.layerStack.layers[0].opacity)
+	}
+	dc.PopLayer()
+
+	dc.PushLayer(BlendNormal, math.Inf(-1))
+	if dc.layerStack.layers[0].opacity != 0 {
+		t.Errorf("-Inf opacity: got %f, want 0", dc.layerStack.layers[0].opacity)
+	}
+	dc.PopLayer()
+
+	dc.PushLayer(BlendNormal, math.Inf(1))
+	if dc.layerStack.layers[0].opacity != 1 {
+		t.Errorf("+Inf opacity: got %f, want 1", dc.layerStack.layers[0].opacity)
 	}
 	dc.PopLayer()
 }

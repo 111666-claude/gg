@@ -3,6 +3,7 @@ package scene
 import (
 	"context"
 	"image"
+	"math"
 	"runtime"
 	"sync"
 	"time"
@@ -614,6 +615,18 @@ type tileClipState struct {
 	savedPM *gg.Pixmap // the pixmap we were drawing to before this clip
 }
 
+// tileLayerState holds the state for one PushLayer/PopLayer pair during tile
+// rendering. The layer's content is rasterized into an isolated, initially
+// transparent pixmap. On Pop the layer alpha is applied exactly once — scaling
+// all four premultiplied channels — and the result is composited onto the
+// parent pixmap with the encoded blend mode.
+type tileLayerState struct {
+	pm      *gg.Pixmap // isolated layer surface (premultiplied RGBA)
+	savedPM *gg.Pixmap // parent pixmap restored on pop
+	blend   BlendMode  // blend mode used when compositing back onto the parent
+	alpha   float32    // sanitized layer alpha in [0, 1]
+}
+
 // executeEncodingOnTile executes encoding commands on a single tile, delegating
 // rasterization to gg.SoftwareRenderer for analytic anti-aliased output.
 //
@@ -634,6 +647,11 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 
 	// clipStack tracks nested clip states for BeginClip/EndClip pairs.
 	var clipStack []tileClipState
+
+	// layerStack tracks nested PushLayer/PopLayer pairs. Each entry owns an
+	// isolated transparent pixmap that becomes the render target while the
+	// layer is active; the parent pixmap is saved for the matching pop.
+	var layerStack []tileLayerState
 
 	// Reusable gg.Path for convertPath — avoids per-fill/stroke allocation.
 	ggPath := r.pool.getGGPath()
@@ -702,7 +720,7 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 
 		case TagFillRoundRect:
 			brush, _, rect, rx, ry := dec.FillRoundRect()
-			renderFillRoundRect(pm, currentTransform, brush, rect, rx, ry, tileX, tileY)
+			renderFillRoundRect(activePM, currentTransform, brush, rect, rx, ry, tileX, tileY)
 
 		case TagStroke:
 			brush, style := dec.Stroke()
@@ -714,11 +732,43 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 			pathActive = false
 
 		case TagPushLayer:
-			_, alpha := dec.PushLayer()
-			_ = alpha // CPU tile renderer: layer alpha applied during compositing (TODO: implement per-layer alpha blending)
+			blend, alpha := dec.PushLayer()
+			// Sanitize at the playback boundary too: an encoding produced
+			// elsewhere (or decoded from untrusted bytes) may carry NaN/Inf
+			// or out-of-range alpha. Rules match sanitizeLayerAlpha.
+			alpha = sanitizeLayerAlpha(alpha)
+
+			// Isolate the layer content in a fresh, fully transparent pixmap
+			// at the current surface size. Using the active size keeps every
+			// parent/child pair equal-sized so compositing can never walk off
+			// the end of a row into the next row.
+			layerW, layerH := activePM.Width(), activePM.Height()
+			layerPM := r.pool.getPixmap(layerW, layerH)
+			layerStack = append(layerStack, tileLayerState{
+				pm:      layerPM,
+				savedPM: activePM,
+				blend:   blend,
+				alpha:   alpha,
+			})
+			activePM = layerPM
 
 		case TagPopLayer:
-			// CPU tile renderer: layer compositing (TODO: implement proper layer pop with alpha)
+			// Extra Pop with no matching Push (malformed/unbalanced stream):
+			// touch nothing so stale pixels can never appear.
+			if len(layerStack) == 0 {
+				continue
+			}
+			state := layerStack[len(layerStack)-1]
+			layerStack = layerStack[:len(layerStack)-1]
+
+			// Pop order: apply this layer's alpha once, then composite onto
+			// the parent with the layer's blend mode. Nested children have
+			// already been composited into state.pm by their own pops.
+			compositeLayerOnPop(state, activePM)
+
+			// Return the isolated surface and restore the parent target.
+			r.pool.putPixmap(state.pm)
+			activePM = state.savedPM
 
 		case TagBeginClip:
 			tileW := activePM.Width()
@@ -793,6 +843,17 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 		}
 	}
 
+	// Safety: if the layer stack is not empty (stream ended without matching
+	// PopLayer tags), pop every remaining layer with its recorded alpha and
+	// blend mode instead of discarding or leaking its content.
+	for len(layerStack) > 0 {
+		state := layerStack[len(layerStack)-1]
+		layerStack = layerStack[:len(layerStack)-1]
+		compositeLayerOnPop(state, activePM)
+		r.pool.putPixmap(state.pm)
+		activePM = state.savedPM
+	}
+
 	// Safety: if clip stack is not empty (unbalanced clips), composite remaining.
 	for len(clipStack) > 0 {
 		state := clipStack[len(clipStack)-1]
@@ -804,8 +865,8 @@ func (r *Renderer) executeEncodingOnTile(dec *Decoder, tile *parallel.Tile, pm *
 		activePM = state.savedPM
 	}
 
-	// If activePM differs from pm (shouldn't happen with balanced clips, but be safe),
-	// copy data back to the original tile pixmap.
+	// If activePM differs from pm (shouldn't happen with balanced layer/clip
+	// streams, but be safe), copy data back to the original tile pixmap.
 	if activePM != pm {
 		copy(pm.Data(), activePM.Data())
 		r.pool.putPixmap(activePM)
@@ -881,6 +942,112 @@ func compositePixmaps(dst, src *gg.Pixmap) {
 		dstData[i+2] = srcData[i+2] + uint8((uint32(dstData[i+2])*invAlpha+127)/255)
 		dstData[i+3] = srcData[i+3] + uint8((uint32(dstData[i+3])*invAlpha+127)/255)
 	}
+}
+
+// compositeLayerOnPop finalizes one isolated tile layer when its PopLayer tag
+// is reached (or during end-of-stream recovery for an unbalanced stream).
+//
+// The layer alpha is applied exactly once: every channel of the layer's
+// premultiplied pixels — including alpha — is scaled by alpha, so transparent
+// and anti-aliased edge pixels keep valid premultiplied semantics (color stays
+// <= alpha and fully transparent pixels stay transparent black). The scaled
+// layer is then composited onto the parent pixmap using the layer's blend
+// mode.
+//
+// The parent surface is written row by row using the parent's own dimensions,
+// so a parent/child size mismatch (edge tiles, or a filter-expanded layer
+// bounds) can never continue a row past the parent's stride into the next
+// row's pixels.
+func compositeLayerOnPop(state tileLayerState, layerPM *gg.Pixmap) {
+	// Defensive: the recorded layer surface must be the active target.
+	if layerPM != state.pm || state.savedPM == nil {
+		return
+	}
+
+	// alpha == 0: the whole layer contributes nothing. Do not touch the
+	// parent, which also covers empty layers and NaN-cleaned alpha.
+	alpha := state.alpha
+	if alpha <= 0 {
+		return
+	}
+
+	if alpha < 1 {
+		scalePremulAlpha(state.pm, alpha)
+	}
+
+	compositeLayerPixmaps(state.savedPM, state.pm, state.blend)
+}
+
+// scalePremulAlpha multiplies all four premultiplied RGBA channels of every
+// pixel by alpha (a finite value in (0, 1)). Scaling RGB and alpha by the same
+// factor preserves premultiplied invariants, including the transparent-black
+// edge pixels (0 stays 0).
+//
+//nolint:gosec // G115: bounded float conversion, products stay within [0,255]
+func scalePremulAlpha(pm *gg.Pixmap, alpha float32) {
+	data := pm.Data()
+	a := float64(alpha)
+	for i := 0; i+3 < len(data); i += 4 {
+		data[i] = clamp255Byte(float64(data[i]) * a)
+		data[i+1] = clamp255Byte(float64(data[i+1]) * a)
+		data[i+2] = clamp255Byte(float64(data[i+2]) * a)
+		data[i+3] = clamp255Byte(float64(data[i+3]) * a)
+	}
+}
+
+// compositeLayerPixmaps blends a premultiplied source layer onto a
+// premultiplied destination using the given scene blend mode.
+//
+// Iteration is driven by the destination dimensions and each row offset is
+// recomputed from the destination stride; differing source/destination sizes
+// therefore cannot spill a write across a row boundary.
+func compositeLayerPixmaps(dst, src *gg.Pixmap, mode BlendMode) {
+	dstW, dstH := dst.Width(), dst.Height()
+	srcW, srcH := src.Width(), src.Height()
+	dstData := dst.Data()
+	srcData := src.Data()
+	blendFn := mode.GetBlendFunc()
+
+	rows := min(dstH, srcH)
+	cols := min(dstW, srcW)
+	for y := 0; y < rows; y++ {
+		dstRow := y * dstW * 4
+		srcRow := y * srcW * 4
+		for x := 0; x < cols; x++ {
+			di := dstRow + x*4
+			si := srcRow + x*4
+			if di+3 >= len(dstData) || si+3 >= len(srcData) {
+				continue
+			}
+			// A fully transparent source pixel leaves the parent unchanged
+			// for every blend mode (Porter-Duff and advanced modes alike).
+			if srcData[si+3] == 0 {
+				continue
+			}
+			r, g, b, a := blendFn(
+				srcData[si], srcData[si+1], srcData[si+2], srcData[si+3],
+				dstData[di], dstData[di+1], dstData[di+2], dstData[di+3],
+			)
+			dstData[di] = r
+			dstData[di+1] = g
+			dstData[di+2] = b
+			dstData[di+3] = a
+		}
+	}
+}
+
+// clamp255Byte rounds a non-negative channel value to the nearest byte and
+// clamps it to [0, 255]. Inputs are products of a byte and alpha in [0, 1],
+// so the upper clamp is the only one needed in practice.
+func clamp255Byte(v float64) uint8 {
+	v = math.Round(v)
+	if v >= 255 {
+		return 255
+	}
+	if v <= 0 {
+		return 0
+	}
+	return uint8(v)
 }
 
 // ---------------------------------------------------------------------------
