@@ -17,6 +17,16 @@ type renderState struct {
 	targetHeight  float64
 	deviceScale   float64
 	outerMatrix   gg.Matrix
+	doc           *Document
+	font          fontState
+}
+
+type fontState struct {
+	family string
+	size   float64
+	weight int
+	italic bool
+	anchor string
 }
 
 type resolvedFill struct {
@@ -90,6 +100,8 @@ func renderElement(dc *gg.Context, elem Element, state *renderState) {
 		}
 	case *GroupElement:
 		renderGroup(dc, e, state)
+	case *TextElement:
+		renderSVGText(dc, e, state)
 	}
 }
 
@@ -136,6 +148,7 @@ func renderGroup(dc *gg.Context, group *GroupElement, state *renderState) {
 	if group.Attrs.Stroke != "" {
 		child.parentStroke = group.Attrs.Stroke
 	}
+	child.font = inheritFontState(group.Attrs, state.font)
 
 	dc.Push()
 	dc.Transform(local)

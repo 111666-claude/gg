@@ -41,6 +41,8 @@ func (d *Document) renderToSceneInternal(
 		targetHeight:  float64(height) * outerScale,
 		deviceScale:   1,
 		outerMatrix:   outer,
+		doc:           d,
+		font:          inheritFontState(d.RootAttrs, defaultFontState()),
 	}
 	renderSceneElements(target, d.Elements, state)
 }
@@ -108,6 +110,8 @@ func renderSceneElement(target *scene.Scene, element Element, state *renderState
 		}
 	case *GroupElement:
 		renderSceneGroup(target, e, state)
+	case *TextElement:
+		renderSceneText(target, e, state)
 	}
 }
 

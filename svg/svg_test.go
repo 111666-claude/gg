@@ -526,9 +526,12 @@ func TestParseUnsupportedElementsSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	// Only the circle should be parsed; defs and text are skipped.
-	if len(doc.Elements) != 1 {
-		t.Errorf("Elements count = %d, want 1 (circle only)", len(doc.Elements))
+	// The circle and text should be parsed; defs remains skipped.
+	if len(doc.Elements) != 2 {
+		t.Fatalf("Elements count = %d, want 2 (circle and text)", len(doc.Elements))
+	}
+	if _, ok := doc.Elements[1].(*TextElement); !ok {
+		t.Fatalf("second element = %T, want *TextElement", doc.Elements[1])
 	}
 }
 

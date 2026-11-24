@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 90">
+  <text x="18" y="30" font-family="FixtureSans" font-size="20" fill="#111111">
+    <tspan x="18" dy="0">First segment</tspan>
+    <tspan x="18" dy="30">Second &amp; final</tspan>
+  </text>
+</svg>

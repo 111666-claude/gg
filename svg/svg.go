@@ -11,8 +11,8 @@ import (
 
 // Render parses SVG XML data and renders it to an RGBA image at the specified size.
 // The SVG viewBox is scaled to fit the target width and height.
-func Render(data []byte, width, height int) (*image.RGBA, error) {
-	doc, err := Parse(data)
+func Render(data []byte, width, height int, opts ...any) (*image.RGBA, error) {
+	doc, err := Parse(data, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -32,30 +32,50 @@ func RenderWithColor(data []byte, width, height int, c color.Color) (*image.RGBA
 
 // Render renders the document to an RGBA image at the specified size.
 // The SVG viewBox is scaled to fit the target dimensions.
-func (d *Document) Render(width, height int) *image.RGBA {
+func (d *Document) Render(width, height int, opts ...any) *image.RGBA {
 	dc := gg.NewContext(width, height)
-	d.RenderTo(dc, 0, 0, float64(width), float64(height))
+	d.RenderTo(dc, 0, 0, float64(width), float64(height), opts...)
 	return dc.Image().(*image.RGBA)
+}
+
+// RenderChecked is Render but returns accumulated text fallback diagnostics.
+func (d *Document) RenderChecked(width, height int, opts ...any) (*image.RGBA, error) {
+	report := &TextReport{}
+	opts = append(opts, WithTextReport(report))
+	img := d.Render(width, height, opts...)
+	return img, report.Err()
 }
 
 // RenderWithColor renders the document with all fill and stroke colors
 // replaced by the given color. Colors set to "none" are preserved.
-func (d *Document) RenderWithColor(width, height int, c color.Color) *image.RGBA {
+func (d *Document) RenderWithColor(width, height int, c color.Color, opts ...any) *image.RGBA {
 	dc := gg.NewContext(width, height)
-	d.RenderToWithColor(dc, 0, 0, float64(width), float64(height), c)
+	d.RenderToWithColor(dc, 0, 0, float64(width), float64(height), c, opts...)
 	return dc.Image().(*image.RGBA)
 }
 
 // RenderTo renders the document into an existing [gg.Context] at the specified
 // position and size. The SVG viewBox is scaled to fit (x, y, width, height).
-func (d *Document) RenderTo(dc *gg.Context, x, y, width, height float64) {
-	d.renderInternal(dc, x, y, width, height, nil)
+func (d *Document) RenderTo(dc *gg.Context, x, y, width, height float64, opts ...any) {
+	cfg := *d
+	cfg.applyOptions(opts...)
+	cfg.renderInternal(dc, x, y, width, height, nil)
+}
+
+// RenderToChecked is RenderTo and returns accumulated text diagnostics.
+func (d *Document) RenderToChecked(dc *gg.Context, x, y, width, height float64, opts ...any) error {
+	report := &TextReport{}
+	opts = append(opts, WithTextReport(report))
+	d.RenderTo(dc, x, y, width, height, opts...)
+	return report.Err()
 }
 
 // RenderToWithColor renders the document into an existing [gg.Context] with
 // all non-"none" colors replaced by the given override color.
-func (d *Document) RenderToWithColor(dc *gg.Context, x, y, width, height float64, c color.Color) {
-	d.renderInternal(dc, x, y, width, height, c)
+func (d *Document) RenderToWithColor(dc *gg.Context, x, y, width, height float64, c color.Color, opts ...any) {
+	cfg := *d
+	cfg.applyOptions(opts...)
+	cfg.renderInternal(dc, x, y, width, height, c)
 }
 
 // renderInternal is the shared rendering implementation.
@@ -89,6 +109,8 @@ func (d *Document) renderInternal(dc *gg.Context, x, y, width, height float64, o
 		targetWidth:   width,
 		targetHeight:  height,
 		deviceScale:   dc.DeviceScale(),
+		doc:           d,
+		font:          inheritFontState(d.RootAttrs, defaultFontState()),
 	}
 
 	renderElements(dc, d.Elements, state)

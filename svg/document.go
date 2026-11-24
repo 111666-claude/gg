@@ -1,5 +1,7 @@
 package svg
 
+import "github.com/gogpu/gg/text"
+
 // Document represents a parsed SVG document.
 // It can be rendered multiple times at different sizes, making it suitable
 // for caching parsed SVG icons.
@@ -16,8 +18,42 @@ type Document struct {
 	// Common in expui icons: fill="none" on root.
 	RootFill string
 
+	// RootAttrs contains all presentation/style attributes on the root <svg>.
+	RootAttrs Attrs
+
 	// Elements contains the top-level SVG elements.
 	Elements []Element
+
+	// Font is an optional face used when an SVG text element does not name a
+	// resolvable family. Source-backed faces are automatically resized to each
+	// element's font-size. MultiFace values are used through gg's fallback
+	// renderer when shaped source runs are unavailable.
+	Font text.Face
+
+	// FontFace is an alias for Font for callers that prefer the explicit name.
+	FontFace text.Face
+
+	// TextFont is an additional alias used by some text rendering APIs.
+	TextFont text.Face
+
+	// FontResolver, when non-nil, resolves font-family names. If it is nil the
+	// package's best-effort system resolver is used.
+	FontResolver FontResolver
+
+	// FallbackFonts are tried after the family resolver and before/alongside
+	// system fallback fonts.
+	FallbackFonts []text.Face
+
+	// NamedFonts maps a normalized font-family name to a face. It offers a
+	// simple way to supply external fonts without implementing FontResolver.
+	NamedFonts map[string]text.Face
+
+	// TextOptions configures bounds and diagnostics for <text>/<tspan>.
+	TextOptions TextOptions
+
+	// Warnings contains non-fatal parse/render diagnostics collected when
+	// TextOptions.RecordWarnings is enabled.
+	Warnings []error
 }
 
 // ViewBox represents the SVG viewBox attribute.
@@ -38,6 +74,22 @@ type Attrs struct {
 	Opacity       float64 // element-level opacity, default 1
 	Transform     string  // raw transform string
 	ClipRule      string  // "evenodd", "nonzero", ""
+
+	// Font and text presentation properties. Raw values are retained so
+	// relative sizes (em/%) and inherited weight/style can be resolved while
+	// traversing the document.
+	FontFamily      string
+	FontSize        float64
+	FontSizeRaw     string
+	FontSizeSet     bool
+	FontWeight      string
+	FontWeightValue int
+	FontWeightSet   bool
+	FontStyle       string
+	TextAnchor      string
+	Direction       string
+	Style           string
+	XMLSpace        string
 }
 
 // Element is the interface implemented by all SVG element types.
@@ -112,3 +164,90 @@ type GroupElement struct {
 }
 
 func (e *GroupElement) attrs() *Attrs { return &e.Attrs }
+
+// TextElement represents an SVG <text> element.
+//
+// Content contains all decoded character data below the element, including
+// text nested in tspans. DirectContent contains only character data that is a
+// direct child of <text>. TSpans contains explicit <tspan> children. Children
+// preserves document order and may contain *TextRun and *TSpanElement values.
+type TextElement struct {
+	Attrs
+
+	X  float64
+	Y  float64
+	DX float64
+	DY float64
+
+	XValues  []float64
+	YValues  []float64
+	DXValues []float64
+	DYValues []float64
+
+	XSet  bool
+	YSet  bool
+	DXSet bool
+	DYSet bool
+
+	Content       string
+	Text          string // alias for Content
+	Value         string // alias for Content
+	DirectContent string
+	TSpans        []*TSpanElement
+	Spans         []TSpanElement // value alias for callers expecting values
+	Children      []Element
+	ParseErrors   []error
+}
+
+func (e *TextElement) attrs() *Attrs { return &e.Attrs }
+
+// TSpanElement represents an SVG <tspan> element.
+type TSpanElement struct {
+	Attrs
+
+	X  float64
+	Y  float64
+	DX float64
+	DY float64
+
+	XValues  []float64
+	YValues  []float64
+	DXValues []float64
+	DYValues []float64
+
+	XSet  bool
+	YSet  bool
+	DXSet bool
+	DYSet bool
+
+	Content  string
+	Text     string // alias for Content
+	Value    string // alias for Content
+	TSpans   []*TSpanElement
+	Spans    []TSpanElement // value alias for callers expecting values
+	Children []Element
+}
+
+func (e *TSpanElement) attrs() *Attrs { return &e.Attrs }
+
+// TSpan is an alias for TSpanElement.
+type TSpan = TSpanElement
+
+// Text is an alias for TextElement for callers that prefer the short name.
+type Text = TextElement
+
+// SVGTextElement is an alternate descriptive alias.
+type SVGTextElement = TextElement
+
+// TextNode is an alias for decoded character runs.
+type TextNode = TextRun
+
+// TextRun is decoded character data in its original document position.
+type TextRun struct {
+	Attrs
+	Content string
+	Text    string
+	Value   string
+}
+
+func (r *TextRun) attrs() *Attrs { return &r.Attrs }

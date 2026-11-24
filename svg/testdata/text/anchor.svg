@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 100">
+  <text x="110" y="24" text-anchor="start" font-family="FixtureSans" font-size="18" fill="#111111">start</text>
+  <text x="110" y="54" text-anchor="middle" font-family="FixtureSans" font-size="18" fill="#111111">middle</text>
+  <text x="110" y="84" text-anchor="end" font-family="FixtureSans" font-size="18" fill="#111111">end</text>
+</svg>

@@ -296,6 +296,11 @@ func collectDesiredFeatures(userFeatures []FontFeature) (gsubTags, gposTags [][4
 	clig := [4]byte{'c', 'l', 'i', 'g'}
 	rlig := [4]byte{'r', 'l', 'i', 'g'}
 	dlig := [4]byte{'d', 'l', 'i', 'g'}
+	calt := [4]byte{'c', 'a', 'l', 't'}
+	isol := [4]byte{'i', 's', 'o', 'l'}
+	fina := [4]byte{'f', 'i', 'n', 'a'}
+	medi := [4]byte{'m', 'e', 'd', 'i'}
+	init := [4]byte{'i', 'n', 'i', 't'}
 
 	// GSUB defaults.
 	gsubEnabled := map[[4]byte]bool{
@@ -304,6 +309,14 @@ func collectDesiredFeatures(userFeatures []FontFeature) (gsubTags, gposTags [][4
 		clig: true,
 		rlig: true,
 		dlig: true,
+		calt: true,
+		// Arabic shaping requires positional glyph substitutions. HarfBuzz
+		// enables these by script; including them by default is harmless for
+		// fonts whose GSUB does not contain the features.
+		isol: true,
+		fina: true,
+		medi: true,
+		init: true,
 	}
 
 	// GPOS defaults.
@@ -352,6 +365,10 @@ func isGSUBFeature(tag [4]byte) bool {
 		{'s', 'w', 's', 'h'}: true, // Swash
 		{'s', 'a', 'l', 't'}: true, // Stylistic alternates
 		{'c', 'a', 'l', 't'}: true, // Contextual alternates
+		{'i', 's', 'o', 'l'}: true, // Arabic isolated forms
+		{'f', 'i', 'n', 'a'}: true, // Arabic final forms
+		{'m', 'e', 'd', 'i'}: true, // Arabic medial forms
+		{'i', 'n', 'i', 't'}: true, // Arabic initial forms
 	}
 	return gsubFeatures[tag]
 }

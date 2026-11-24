@@ -14,6 +14,7 @@
 //   - <line> x1, y1, x2, y2
 //   - <polygon> points
 //   - <polyline> points
+//   - <text> and <tspan> with x/y/dx/dy, font and text-anchor inheritance
 //   - <g> grouping with inherited attributes and transform
 //
 // # Supported Attributes
@@ -22,6 +23,13 @@
 //   - stroke, stroke-width, stroke-linecap, stroke-linejoin, stroke-opacity
 //   - transform (translate, rotate, scale, matrix)
 //   - opacity
+//   - font-family, font-size, font-weight, font-style, text-anchor, direction
+//
+// Text uses github.com/gogpu/gg/text shaping and font fallback. Supply a face
+// with [WithFont], set [Document.Font], call [SetDefaultFont], or configure a
+// [FontResolver]; platform fonts are used as a best-effort fallback. Use
+// [Document.RenderToChecked] or [Document.RenderChecked] to collect recoverable
+// missing-glyph, invalid-coordinate and length diagnostics.
 //
 // # Usage
 //

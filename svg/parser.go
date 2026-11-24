@@ -12,13 +12,17 @@ import (
 // The Document can be rendered multiple times at different sizes.
 //
 // Only the SVG subset needed for icon rendering is supported.
-// Unsupported elements are silently skipped.
-func Parse(data []byte) (*Document, error) {
+// Unsupported graphical elements are silently skipped. Text and tspan elements
+// are retained; text rendering uses explicit/configured fonts and documented
+// fallbacks when platform fonts are unavailable.
+func Parse(data []byte, opts ...any) (*Document, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.Entity = xml.HTMLEntity
 
 	doc := &Document{
 		ViewBox: ViewBox{Width: 16, Height: 16}, // sensible default
 	}
+	doc.applyOptions(opts...)
 
 	// Find the root <svg> element.
 	for {
@@ -35,6 +39,10 @@ func Parse(data []byte) (*Document, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := validateTextParseErrors(children, doc.TextOptions.StrictCoordinates); err != nil {
+				return nil, err
+			}
+			applyTextInheritance(children, doc.RootAttrs, 16)
 			doc.Elements = children
 			return doc, nil
 		}
@@ -43,6 +51,8 @@ func Parse(data []byte) (*Document, error) {
 
 // parseSVGRoot extracts viewBox, width, height from the <svg> element attributes.
 func parseSVGRoot(doc *Document, se xml.StartElement) error {
+	doc.RootAttrs = parseAttrs(se)
+	doc.RootFill = doc.RootAttrs.Fill
 	for _, attr := range se.Attr {
 		switch attr.Name.Local {
 		case "viewBox":
@@ -161,8 +171,14 @@ func parseElement(decoder *xml.Decoder, se xml.StartElement) (Element, error) {
 		return parsePolylineElement(decoder, se)
 	case "g":
 		return parseGroupElement(decoder, se)
+	case "text":
+		return parseTextElement(decoder, se)
+	case "tspan":
+		return parseTSpanElement(decoder, se)
 	default:
-		// Skip unsupported elements (defs, clipPath, use, text, etc.).
+		// Skip unsupported elements (defs, clipPath, use, etc.). Text and
+		// tspan are handled above; skipping an unknown element also consumes
+		// its raw XML markup instead of treating tags as visible text.
 		if err := decoder.Skip(); err != nil {
 			return nil, fmt.Errorf("svg: error skipping <%s>: %w", se.Name.Local, err)
 		}
@@ -210,7 +226,32 @@ func parseAttrs(se xml.StartElement) Attrs {
 			a.Transform = attr.Value
 		case "clip-rule":
 			a.ClipRule = attr.Value
+		case "style":
+			a.Style = attr.Value
+		case "font-family":
+			a.FontFamily = attr.Value
+		case "font-size":
+			a.FontSizeRaw = strings.TrimSpace(attr.Value)
+			a.FontSizeSet = true
+			if size, err := parseSVGFontSize(a.FontSizeRaw); err == nil {
+				a.FontSize = size
+			}
+		case "font-weight":
+			a.FontWeight = strings.TrimSpace(attr.Value)
+			a.FontWeightSet = true
+			a.FontWeightValue = parseFontWeightValue(a.FontWeight)
+		case "font-style":
+			a.FontStyle = strings.TrimSpace(attr.Value)
+		case "text-anchor":
+			a.TextAnchor = strings.TrimSpace(attr.Value)
+		case "direction":
+			a.Direction = strings.TrimSpace(attr.Value)
+		case "xml:space", "space":
+			a.XMLSpace = strings.TrimSpace(attr.Value)
 		}
+	}
+	if a.Style != "" {
+		applyInlineStyle(&a)
 	}
 	return a
 }
