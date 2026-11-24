@@ -56,6 +56,9 @@ func NewSoftwareRenderer() *SoftwareRenderer {
 // it to the target using CPU-based rasterization.
 //
 // Returns an error if the target is GPU-only (no Pixels() support).
+// Invalid texture draws (missing resource, bad rectangles, non-finite
+// transform, oversized image) are skipped and reported via a joined error
+// without aborting the rest of the scene.
 func (r *SoftwareRenderer) Render(target RenderTarget, scene *Scene) error {
 	if target == nil {
 		return errors.New("render: nil target")
@@ -77,6 +80,8 @@ func (r *SoftwareRenderer) Render(target RenderTarget, scene *Scene) error {
 	// Ensure filler is sized correctly
 	r.ensureFiller(width, height)
 
+	var imageErrs []error
+
 	// Process each command
 	for _, cmd := range scene.drawCommands() {
 		switch cmd.op {
@@ -92,10 +97,16 @@ func (r *SoftwareRenderer) Render(target RenderTarget, scene *Scene) error {
 			if cmd.path != nil && !cmd.path.IsEmpty() {
 				r.renderStroke(pixels, width, height, stride, cmd.path, cmd.color, cmd.width)
 			}
+
+		case opImage:
+			if err := r.renderImage(pixels, width, height, stride, &cmd.imageOp); err != nil {
+				// Safe degradation: skip the offending draw, keep rendering.
+				imageErrs = append(imageErrs, err)
+			}
 		}
 	}
 
-	return nil
+	return errors.Join(imageErrs...)
 }
 
 // Flush ensures all rendering is complete.
@@ -111,9 +122,27 @@ func (r *SoftwareRenderer) Capabilities() RendererCapabilities {
 		SupportsAntialiasing: true,
 		SupportsBlendModes:   false, // TODO: implement
 		SupportsGradients:    false, // TODO: implement
-		SupportsTextures:     false, // TODO: implement
-		MaxTextureSize:       0,     // No limit
+		SupportsTextures:     true,
+		MaxTextureSize:       maxSoftwareTextureSize,
 	}
+}
+
+// renderImage validates and rasterizes one texture draw. All failure modes are
+// returned as contextual errors so the Render loop can skip the draw safely
+// instead of corrupting the target or panicking.
+func (r *SoftwareRenderer) renderImage(pixels []byte, width, height, stride int, op *ImageDrawOp) error {
+	src, err := validateImageDrawOp(op)
+	if err != nil {
+		return err
+	}
+
+	// A target with zero/negative stride cannot be indexed safely.
+	if stride < width*4 || len(pixels) < stride*height {
+		return errors.New("render: target buffer too small for image draw")
+	}
+
+	drawTexture(pixels, width, height, stride, op, src)
+	return nil
 }
 
 // ensureFiller ensures the filler is sized for the target dimensions.

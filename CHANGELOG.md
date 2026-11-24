@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Software texture rendering** — the lightweight `render.SoftwareRenderer`
+  now draws images instead of skipping image commands. `Scene.DrawImage` /
+  `Scene.DrawImageOp` map a source rectangle onto a destination rectangle with
+  nearest-neighbor or bilinear sampling (in premultiplied-alpha space),
+  opacity, flips and arbitrary affine transforms. `RendererCapabilities`
+  reports `SupportsTextures` with a 32767px `MaxTextureSize`. Missing
+  resources, illegal rectangles, non-finite matrices and oversized images are
+  validated up front and skipped with a contextual error without aborting the
+  rest of the scene.
+- **Recording preflight** — `Recording.Validate()` checks every resource
+  reference and `DrawImage` geometry before `Playback`, rejecting corrupt
+  recordings before any backend call. The raster backend's `DrawImage` now
+  performs a real source-to-destination blit (it previously only stroked a
+  rectangle). `ImageSurface.DrawImage` gains `DstRect` scaling and bilinear
+  filtering alongside the existing nearest path.
+
 ## [0.52.7] - 2026-11-08
 
 ### Added

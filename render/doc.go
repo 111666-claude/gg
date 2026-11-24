@@ -24,6 +24,13 @@
 //   - SoftwareRenderer: CPU-based rendering using the core/ package
 //   - GPURenderer: GPU-accelerated rendering (stub for Phase 3)
 //
+// The SoftwareRenderer supports texture draws (Scene.DrawImage /
+// DrawImageOp): source-rectangle to destination-rectangle mapping with
+// nearest-neighbor or bilinear sampling in premultiplied-alpha space,
+// opacity modulation, flips and arbitrary affine transforms. Invalid draws
+// (missing image, illegal rectangles, non-finite matrices, oversized images)
+// are skipped and reported as errors without aborting the rest of the scene.
+//
 // # RenderTarget Implementations
 //
 //   - PixmapTarget: CPU-backed *image.RGBA target

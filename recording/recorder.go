@@ -135,7 +135,16 @@ func (r *Recording) Resources() *ResourcePool {
 }
 
 // Playback replays the recording to the given backend.
+//
+// The recording is validated before any backend call: missing resources,
+// out-of-range source rectangles, empty destinations and non-finite geometry
+// are rejected with a contextual error instead of reaching the backend as a
+// nil image or NaN transform.
 func (r *Recording) Playback(backend Backend) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+
 	// Initialize backend
 	if err := backend.Begin(r.width, r.height); err != nil {
 		return err

@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 
 	"github.com/gogpu/gg/internal/raster"
 )
@@ -176,44 +177,248 @@ func (s *ImageSurface) Stroke(path *Path, style StrokeStyle) {
 }
 
 // DrawImage draws an image at the specified position.
+//
+// When opts is nil the image is blitted 1:1 at `at` with nearest-neighbor
+// sampling (the historical default). opts.SrcRect selects a sub-rectangle of
+// the source; opts.DstRect maps that source onto an arbitrary destination
+// rectangle (scaling and flips). opts.Filter selects nearest or bilinear
+// sampling and opts.Alpha applies an opacity multiplier.
+//
+// Sampling and compositing run in premultiplied-alpha space so transparent
+// source pixels never darken semi-transparent edges. All geometry is clipped
+// to the surface bounds before indexing; out-of-range, empty or oversized
+// inputs degrade to a no-op rather than panicking.
 func (s *ImageSurface) DrawImage(img image.Image, at Point, opts *DrawImageOptions) {
 	if s.closed || img == nil {
 		return
 	}
 
-	srcBounds := img.Bounds()
-	if opts != nil && opts.SrcRect != nil {
-		srcBounds = *opts.SrcRect
+	bounds := img.Bounds()
+	if bounds.Empty() {
+		return
 	}
 
-	dstX := int(at.X)
-	dstY := int(at.Y)
-
+	srcBounds := bounds
 	alpha := 1.0
+	filter := FilterNearest
+	var dstBounds *image.Rectangle
 	if opts != nil {
+		if opts.SrcRect != nil {
+			srcBounds = *opts.SrcRect
+		}
 		alpha = opts.Alpha
+		filter = opts.Filter
+		dstBounds = opts.DstRect
 	}
 
-	// Simple nearest-neighbor blit for now
-	for sy := srcBounds.Min.Y; sy < srcBounds.Max.Y; sy++ {
-		dy := dstY + (sy - srcBounds.Min.Y)
-		if dy < 0 || dy >= s.height {
-			continue
-		}
+	srcBounds = srcBounds.Intersect(bounds)
+	if srcBounds.Empty() {
+		return
+	}
+	if alpha <= 0 {
+		return
+	}
+	if alpha > 1 {
+		alpha = 1
+	}
 
-		for sx := srcBounds.Min.X; sx < srcBounds.Max.X; sx++ {
-			dx := dstX + (sx - srcBounds.Min.X)
-			if dx < 0 || dx >= s.width {
+	// Default destination: source-sized rectangle at `at`.
+	dstX, dstY := int(at.X), int(at.Y)
+	dstW, dstH := srcBounds.Dx(), srcBounds.Dy()
+	if dstBounds != nil && !dstBounds.Empty() {
+		dstX = dstBounds.Min.X
+		dstY = dstBounds.Min.Y
+		dstW = dstBounds.Dx()
+		dstH = dstBounds.Dy()
+	}
+	if dstW == 0 || dstH == 0 {
+		return
+	}
+
+	source := s.ensureRGBA(img)
+	blitImageScaled(s.img, source, srcBounds, image.Rect(dstX, dstY, dstX+dstW, dstY+dstH), filter, alpha)
+}
+
+// ensureRGBA returns a tightly packed, premultiplied RGBA view of img. An
+// *image.RGBA source is reused directly (its documented storage is
+// premultiplied); other color models are converted once so the blit hot loop
+// has a single representation.
+func (s *ImageSurface) ensureRGBA(img image.Image) *image.RGBA {
+	if rgba, ok := img.(*image.RGBA); ok {
+		return rgba
+	}
+	bounds := img.Bounds()
+	packed := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(packed, packed.Bounds(), img, bounds.Min, draw.Src)
+	return packed
+}
+
+// blitImageScaled maps srcBounds of source onto dstBounds of the destination
+// image, inverse-mapping each destination pixel center and compositing the
+// sampled premultiplied color source-over. Negative dimensions are normalized
+// via the rectangle conventions; the iteration range is clipped to dst so no
+// write leaves the buffer.
+func blitImageScaled(dst, src *image.RGBA, srcBounds, dstBounds image.Rectangle, filter Filter, alpha float64) {
+	srcW := srcBounds.Dx()
+	srcH := srcBounds.Dy()
+	dstW := dstBounds.Dx()
+	dstH := dstBounds.Dy()
+	if srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 {
+		return
+	}
+
+	scaleX := float64(dstW) / float64(srcW)
+	scaleY := float64(dstH) / float64(srcH)
+
+	// Clip the destination iteration to the target buffer.
+	x0 := maxIntSurface(dstBounds.Min.X, dst.Rect.Min.X)
+	y0 := maxIntSurface(dstBounds.Min.Y, dst.Rect.Min.Y)
+	x1 := minIntSurface(dstBounds.Max.X, dst.Rect.Max.X)
+	y1 := minIntSurface(dstBounds.Max.Y, dst.Rect.Max.Y)
+
+	maxSrcX := srcBounds.Max.X - 1
+	maxSrcY := srcBounds.Max.Y - 1
+
+	for dy := y0; dy < y1; dy++ {
+		for dx := x0; dx < x1; dx++ {
+			fx := (float64(dx-dstBounds.Min.X)+0.5)/scaleX - 0.5
+			fy := (float64(dy-dstBounds.Min.Y)+0.5)/scaleY - 0.5
+			u := fx + float64(srcBounds.Min.X)
+			v := fy + float64(srcBounds.Min.Y)
+
+			var sr, sg, sb, sa float64
+			if filter == FilterBilinear {
+				sr, sg, sb, sa = sampleBilinearSurface(src, u, v,
+					float64(srcBounds.Min.X), float64(srcBounds.Min.Y),
+					float64(maxSrcX), float64(maxSrcY))
+			} else {
+				// Nearest: round the texel-center coordinate.
+				nx := clampIntSurface(int(math.Round(u)), srcBounds.Min.X, maxSrcX)
+				ny := clampIntSurface(int(math.Round(v)), srcBounds.Min.Y, maxSrcY)
+				sr, sg, sb, sa = fetchPremulSurface(src, nx, ny)
+			}
+
+			if alpha < 1 {
+				sr *= alpha
+				sg *= alpha
+				sb *= alpha
+				sa *= alpha
+			}
+			if sa <= 0 {
 				continue
 			}
-
-			srcColor := img.At(sx, sy)
-			if alpha < 1.0 {
-				srcColor = s.applyAlpha(srcColor, alpha)
-			}
-			s.blendPixel(dx, dy, srcColor)
+			compositePremulSurface(dst, dx, dy, clampByteSurface(sr), clampByteSurface(sg), clampByteSurface(sb), clampByteSurface(sa))
 		}
 	}
+}
+
+// fetchPremulSurface reads one premultiplied texel as [0,255] floats.
+func fetchPremulSurface(src *image.RGBA, x, y int) (r, g, b, a float64) {
+	i := src.PixOffset(x, y)
+	if i < 0 || i+3 >= len(src.Pix) {
+		return 0, 0, 0, 0
+	}
+	a = float64(src.Pix[i+3])
+	if a == 0 {
+		return 0, 0, 0, 0
+	}
+	return float64(src.Pix[i]), float64(src.Pix[i+1]), float64(src.Pix[i+2]), a
+}
+
+// sampleBilinearSurface performs 2x2 bilinear filtering in premultiplied space
+// with clamp-to-edge addressing.
+func sampleBilinearSurface(src *image.RGBA, u, v, minX, minY, maxX, maxY float64) (r, g, b, a float64) {
+	ix := floorIntSurface(u - 0.5)
+	iy := floorIntSurface(v - 0.5)
+	xf := u - 0.5 - math.Floor(u-0.5)
+	yf := v - 0.5 - math.Floor(v-0.5)
+
+	x0 := clampIntSurface(ix, int(minX), int(maxX))
+	x1 := clampIntSurface(ix+1, int(minX), int(maxX))
+	y0 := clampIntSurface(iy, int(minY), int(maxY))
+	y1 := clampIntSurface(iy+1, int(minY), int(maxY))
+
+	r00, g00, b00, a00 := fetchPremulSurface(src, x0, y0)
+	r10, g10, b10, a10 := fetchPremulSurface(src, x1, y0)
+	r01, g01, b01, a01 := fetchPremulSurface(src, x0, y1)
+	r11, g11, b11, a11 := fetchPremulSurface(src, x1, y1)
+
+	w00 := (1 - xf) * (1 - yf)
+	w10 := xf * (1 - yf)
+	w01 := (1 - xf) * yf
+	w11 := xf * yf
+
+	r = r00*w00 + r10*w10 + r01*w01 + r11*w11
+	g = g00*w00 + g10*w10 + g01*w01 + g11*w11
+	b = b00*w00 + b10*w10 + b01*w01 + b11*w11
+	a = a00*w00 + a10*w10 + a01*w01 + a11*w11
+	return
+}
+
+// compositePremulSurface blends a premultiplied source onto a premultiplied
+// destination pixel with source-over.
+func compositePremulSurface(dst *image.RGBA, x, y int, sr, sg, sb, sa byte) {
+	i := dst.PixOffset(x, y)
+	if i < 0 || i+3 >= len(dst.Pix) {
+		return
+	}
+	if sa == 0 {
+		return
+	}
+	if sa == 255 {
+		dst.Pix[i] = sr
+		dst.Pix[i+1] = sg
+		dst.Pix[i+2] = sb
+		dst.Pix[i+3] = 255
+		return
+	}
+	inv := uint16(255 - sa)
+	dst.Pix[i] = sr + byte((uint16(dst.Pix[i])*inv+127)/255)
+	dst.Pix[i+1] = sg + byte((uint16(dst.Pix[i+1])*inv+127)/255)
+	dst.Pix[i+2] = sb + byte((uint16(dst.Pix[i+2])*inv+127)/255)
+	dst.Pix[i+3] = sa + byte((uint16(dst.Pix[i+3])*inv+127)/255)
+}
+
+func clampByteSurface(v float64) byte {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 255 {
+		return 255
+	}
+	return byte(v + 0.5)
+}
+
+func clampIntSurface(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func floorIntSurface(v float64) int {
+	i := int(v)
+	if v < float64(i) {
+		return i - 1
+	}
+	return i
+}
+
+func minIntSurface(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxIntSurface(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // Flush ensures all pending operations are complete.
@@ -349,19 +554,6 @@ func (s *ImageSurface) blendPixel(x, y int, src color.Color) {
 	//nolint:gosec // G115: safe
 	srcA := uint8(a >> 8)
 	s.blendPixelAlpha(x, y, color.RGBA{srcR, srcG, srcB, srcA}, 255)
-}
-
-// applyAlpha multiplies a color's alpha by the given factor.
-func (s *ImageSurface) applyAlpha(c color.Color, alpha float64) color.Color {
-	r, g, b, a := c.RGBA()
-	newA := uint16(float64(a) * alpha)
-	//nolint:gosec // G115: safe - r,g,b are uint32 from RGBA() which fits uint16
-	return color.RGBA64{
-		R: uint16(r),
-		G: uint16(g),
-		B: uint16(b),
-		A: newA,
-	}
 }
 
 // expandStroke creates a filled path representing the stroke outline.

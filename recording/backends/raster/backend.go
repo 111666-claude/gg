@@ -13,6 +13,8 @@
 //   - Path operations (fill, stroke, clip)
 //   - Transform matrix
 //   - Stroke styling (width, cap, join, dash patterns)
+//   - Image draws: source-to-destination rectangle mapping, nearest/bilinear
+//     sampling, opacity, flips and the recorded transform
 //   - State management (Save/Restore)
 //   - PNG output
 //
@@ -204,45 +206,88 @@ func (b *Backend) FillRect(rect recording.Rect, brush recording.Brush) {
 }
 
 // DrawImage draws an image from source to destination rectangle.
-func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, _ recording.ImageOptions) {
-	if img == nil {
+// The recording's current transform is already active on the context; the
+// source-to-destination mapping is expressed as an additional local
+// transform so rotation, scale and flips recorded in DstRect are preserved.
+func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, opts recording.ImageOptions) {
+	if img == nil || b.ctx == nil {
 		return
 	}
 
-	// Save current state
+	bounds := img.Bounds()
+	if bounds.Empty() {
+		return
+	}
+
+	// Normalize the source rectangle; an empty/zero rect means the whole image.
+	srcW := src.Width()
+	srcH := src.Height()
+	if srcW <= 0 || srcH <= 0 {
+		src = recording.NewRect(
+			float64(bounds.Min.X), float64(bounds.Min.Y),
+			float64(bounds.Dx()), float64(bounds.Dy()),
+		)
+		srcW = src.Width()
+		srcH = src.Height()
+	}
+
+	dstW := dst.Width()
+	dstH := dst.Height()
+	if dstW == 0 || dstH == 0 || srcW == 0 || srcH == 0 {
+		return
+	}
+
+	// Clamp the source rect to the image bounds and reject empty intersections.
+	srcRect := image.Rect(
+		int(src.MinX), int(src.MinY),
+		int(src.MaxX), int(src.MaxY),
+	).Intersect(bounds)
+	if srcRect.Empty() {
+		return
+	}
+
+	imageBuf := gg.ImageBufFromImage(img)
+	if imageBuf == nil {
+		return
+	}
+
+	interp := gg.InterpBilinear
+	if opts.Interpolation == recording.InterpolationNearest {
+		interp = gg.InterpNearest
+	}
+
+	alpha := opts.Alpha
+	if alpha <= 0 {
+		alpha = 1.0
+	}
+	if alpha > 1.0 {
+		alpha = 1.0
+	}
+
 	b.ctx.Push()
 	defer b.ctx.Pop()
 
-	// Calculate scale
-	srcW := src.Width()
-	srcH := src.Height()
-	dstW := dst.Width()
-	dstH := dst.Height()
-
-	if srcW == 0 || srcH == 0 {
-		// Use full image bounds
-		bounds := img.Bounds()
-		srcW = float64(bounds.Dx())
-		srcH = float64(bounds.Dy())
-	}
-
+	// Map the source rectangle onto the destination rectangle within the
+	// current transform: translate to dst origin, scale (negative factors
+	// encode flips), then shift by the source origin. DrawImageEx then draws
+	// the source rectangle at 1:1 inside this local coordinate system, so no
+	// second scale is introduced (its pattern transform composes the CTM).
 	scaleX := dstW / srcW
 	scaleY := dstH / srcH
-
-	// Apply transform for scaling and positioning
 	b.ctx.Translate(dst.MinX, dst.MinY)
 	b.ctx.Scale(scaleX, scaleY)
 	b.ctx.Translate(-src.MinX, -src.MinY)
 
-	// Draw the image at origin (transform handles positioning)
-	// Note: gg.Context.DrawImage takes int coordinates
-	// We need to handle the source rect cropping if specified
-	// For now, draw the full image and let the transform handle it
-	bounds := img.Bounds()
-	b.ctx.DrawRectangle(float64(bounds.Min.X), float64(bounds.Min.Y),
-		float64(bounds.Dx()), float64(bounds.Dy()))
-	// TODO: Implement proper image drawing with cropping
-	// For now, use a simple approach
+	b.ctx.DrawImageEx(imageBuf, gg.DrawImageOptions{
+		X:             src.MinX,
+		Y:             src.MinY,
+		DstWidth:      srcW,
+		DstHeight:     srcH,
+		SrcRect:       &srcRect,
+		Interpolation: interp,
+		Opacity:       alpha,
+		BlendMode:     gg.BlendNormal,
+	})
 }
 
 // DrawText draws text at the given position with the specified font face and brush.

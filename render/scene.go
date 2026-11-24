@@ -4,6 +4,7 @@
 package render
 
 import (
+	"image"
 	"image/color"
 
 	"github.com/gogpu/gg/internal/raster"
@@ -74,6 +75,11 @@ type drawCommand struct {
 	color    color.Color
 	width    float64
 	fillRule raster.FillRule
+
+	// imageOp is populated only for opImage commands. It is held by value so
+	// the command stream owns the descriptor; the referenced image.Image is an
+	// immutable interface and is never modified by the renderer.
+	imageOp ImageDrawOp
 }
 
 // drawOp is the type of drawing operation.
@@ -83,6 +89,7 @@ const (
 	opFill drawOp = iota
 	opStroke
 	opClear
+	opImage
 )
 
 // pathBuilder accumulates path construction commands.
@@ -295,6 +302,39 @@ func (s *Scene) Clear(c color.Color) {
 	s.commands = append(s.commands, drawCommand{
 		op:    opClear,
 		color: c,
+	})
+}
+
+// DrawImage records a texture draw mapping the image's full bounds onto the
+// destination rectangle starting at (x, y) with the given size. The image
+// reference is immutable and survives replay unchanged.
+//
+// Use DrawImageOp for source rectangles, filters, flips or transforms.
+func (s *Scene) DrawImage(img image.Image, x, y, width, height float64) {
+	s.DrawImageOp(ImageDrawOp{
+		Image:     img,
+		DstMin:    image.Point{X: int(x), Y: int(y)},
+		DstWidth:  width,
+		DstHeight: height,
+		Filter:    FilterBilinear,
+		Alpha:     1.0,
+		Transform: IdentityTransform(),
+	})
+}
+
+// DrawImageOp records a fully specified texture draw. The operation is
+// validated again at render time; invalid operations are reported through
+// Render's error while the rest of the scene still renders.
+func (s *Scene) DrawImageOp(op ImageDrawOp) {
+	if op.Transform == (AffineTransform{}) {
+		op.Transform = IdentityTransform()
+	}
+	if op.Alpha == 0 {
+		op.Alpha = 1.0
+	}
+	s.commands = append(s.commands, drawCommand{
+		op:      opImage,
+		imageOp: op,
 	})
 }
 
