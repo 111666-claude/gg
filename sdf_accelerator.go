@@ -72,8 +72,13 @@ func (a *SDFAccelerator) SetForceSDF(force bool) {
 // FillShape renders a filled shape using SDF.
 // Shapes smaller than sdfMinSize in either dimension fall back to CPU scanline,
 // unless forceSDF is enabled (RasterizerSDF mode).
+// Non-solid paints (gradients, patterns) fall back to CPU scanline, which
+// samples the brush per-pixel; the SDF path composites a single solid color.
 func (a *SDFAccelerator) FillShape(target GPURenderTarget, shape DetectedShape, paint *Paint) error {
 	if !a.forceSDF && shapeTooSmallForSDF(shape) {
+		return ErrFallbackToCPU
+	}
+	if _, ok := solidColorForMode(paint, false); !ok {
 		return ErrFallbackToCPU
 	}
 	switch shape.Kind {
@@ -94,11 +99,16 @@ func (a *SDFAccelerator) Flush(_ GPURenderTarget) error { return nil }
 // StrokeShape renders a stroked shape using SDF.
 // Shapes smaller than sdfMinSize in either dimension fall back to CPU scanline,
 // unless forceSDF is enabled (RasterizerSDF mode).
+// Non-solid paints (gradients, patterns) fall back to CPU scanline, which
+// samples the brush per-pixel; the SDF path composites a single solid color.
 func (a *SDFAccelerator) StrokeShape(target GPURenderTarget, shape DetectedShape, paint *Paint) error {
 	if !a.forceSDF && shapeTooSmallForSDF(shape) {
 		return ErrFallbackToCPU
 	}
 	if !a.forceSDF && paint.EffectiveLineWidth() < sdfMinStrokeWidth {
+		return ErrFallbackToCPU
+	}
+	if _, ok := solidColorForMode(paint, true); !ok {
 		return ErrFallbackToCPU
 	}
 	switch shape.Kind {

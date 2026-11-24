@@ -1816,6 +1816,12 @@ func (c *Context) doFill() error {
 	c.applyMaskToPaint()
 	defer func() { c.paint.MaskCoverage = nil }()
 
+	// Map device-space sample points back to user space for gradient brushes.
+	// The path is rasterized in device space, but gradient geometry (start/end
+	// points, radii, angles) is defined in user coordinates.
+	c.paint.setGradientTransform(c.totalMatrix())
+	defer c.paint.clearGradientTransform()
+
 	// Transform path to device-space for rendering.
 	// At scale=1.0 this is a zero-copy no-op.
 	devicePath := c.deviceSpacePath()
@@ -1871,6 +1877,11 @@ func (c *Context) doStroke() error {
 
 	c.applyMaskToPaint()
 	defer func() { c.paint.MaskCoverage = nil }()
+
+	// Map device-space sample points back to user space for gradient brushes
+	// (same as doFill — gradient geometry is user-space).
+	c.paint.setGradientTransform(c.totalMatrix())
+	defer c.paint.clearGradientTransform()
 
 	// Transform path to device-space for rendering.
 	devicePath := c.deviceSpacePath()

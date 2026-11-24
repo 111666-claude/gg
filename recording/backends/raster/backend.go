@@ -10,18 +10,16 @@
 // # Supported Features
 //
 //   - Solid color fills and strokes
+//   - Gradient brushes (linear, radial, sweep) with extend modes
 //   - Path operations (fill, stroke, clip)
 //   - Transform matrix
 //   - Stroke styling (width, cap, join, dash patterns)
 //   - State management (Save/Restore)
 //   - PNG output
 //
-// # Limitations
-//
-// Gradient brushes (linear, radial, sweep) are correctly translated to gg
-// brush types, but the underlying gg.SoftwareRenderer currently only supports
-// solid colors. Gradients will render as black until the gg library implements
-// gradient support in its software renderer.
+// Gradients are defined in world (user) coordinates; the backend maps device
+// pixels back to gradient space through the active transform, so gradients
+// render correctly at any device scale.
 //
 // # Example
 //

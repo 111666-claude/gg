@@ -229,6 +229,19 @@ type Paint struct {
 	// (standard alpha-over). Set via Context.SetBlendMode(). The SoftwareRenderer
 	// dispatches to the appropriate blend function when this differs from SourceOver.
 	blendMode paintBlendMode
+
+	// gradientInvTransform maps device-space sample points back to user
+	// (gradient) space. Gradient brushes are defined in user coordinates, but
+	// the renderer samples colors in device space (the path is transformed to
+	// device space before rasterization). Context sets this to the inverse of
+	// the total user-to-device matrix before Fill/Stroke so gradient sampling
+	// stays correct under any transform (scale, rotate, HiDPI device scale).
+	gradientInvTransform Matrix
+
+	// hasGradientInvTransform is true when gradientInvTransform is active.
+	// Kept separate so the zero Matrix value never requires an IsIdentity
+	// comparison on the hot sampling path.
+	hasGradientInvTransform bool
 }
 
 // NewPaint creates a new Paint with default values.
@@ -252,15 +265,17 @@ func NewPaint() *Paint {
 // Both fill and stroke brush states are copied independently.
 func (p *Paint) Clone() *Paint {
 	clone := &Paint{
-		fill:       p.fill,
-		stroke:     p.stroke,
-		LineWidth:  p.LineWidth,
-		LineCap:    p.LineCap,
-		LineJoin:   p.LineJoin,
-		MiterLimit: p.MiterLimit,
-		FillRule:   p.FillRule,
-		Antialias:  p.Antialias,
-		blendMode:  p.blendMode,
+		fill:                    p.fill,
+		stroke:                  p.stroke,
+		LineWidth:               p.LineWidth,
+		LineCap:                 p.LineCap,
+		LineJoin:                p.LineJoin,
+		MiterLimit:              p.MiterLimit,
+		FillRule:                p.FillRule,
+		Antialias:               p.Antialias,
+		blendMode:               p.blendMode,
+		gradientInvTransform:    p.gradientInvTransform,
+		hasGradientInvTransform: p.hasGradientInvTransform,
 	}
 	if p.Stroke != nil {
 		strokeClone := p.Stroke.Clone()
@@ -307,21 +322,70 @@ func (p *Paint) StrokeBrush() Brush {
 	return p.stroke.getBrush()
 }
 
+// isGradientBrush reports whether b is one of the built-in gradient brushes
+// whose geometry is defined in user space. Only these brushes participate in
+// device-to-user gradient transform mapping; solid brushes are position
+// independent and CustomBrush/pattern callbacks receive device coordinates
+// (unchanged legacy behavior).
+func isGradientBrush(b Brush) bool {
+	switch b.(type) {
+	case *LinearGradientBrush, *RadialGradientBrush, *SweepGradientBrush:
+		return true
+	}
+	return false
+}
+
+// setGradientTransform records the user-to-device transform active at render
+// time so gradient brushes can be sampled in user space. The inverse is
+// stored; a non-invertible matrix degrades to identity (Matrix.Invert
+// semantics), which keeps sampling deterministic instead of producing NaN.
+// An identity transform clears the mapping (zero-cost fast path).
+func (p *Paint) setGradientTransform(m Matrix) {
+	if m.IsIdentity() {
+		p.clearGradientTransform()
+		return
+	}
+	p.gradientInvTransform = m.Invert()
+	p.hasGradientInvTransform = true
+}
+
+// clearGradientTransform removes any gradient transform mapping.
+func (p *Paint) clearGradientTransform() {
+	p.gradientInvTransform = Matrix{}
+	p.hasGradientInvTransform = false
+}
+
+// gradientPoint maps a device-space sample point to gradient (user) space
+// when a gradient transform is active and the brush is a gradient.
+func (p *Paint) gradientPoint(brush Brush, x, y float64) (float64, float64) {
+	if p.hasGradientInvTransform && isGradientBrush(brush) {
+		pt := p.gradientInvTransform.TransformPoint(Pt(x, y))
+		return pt.X, pt.Y
+	}
+	return x, y
+}
+
 // ColorAt returns the fill color at the given position (backward compatibility).
 // For solid colors, returns the inline color directly (no interface dispatch).
 //
 // Deprecated: Use FillColorAt() or StrokeColorAt() for explicit side selection.
 func (p *Paint) ColorAt(x, y float64) RGBA {
-	return p.fill.colorAt(x, y)
+	return p.FillColorAt(x, y)
 }
 
 // FillColorAt returns the fill color at the given position.
+// The position is in device space; gradient brushes are sampled in user
+// space via the transform recorded by setGradientTransform.
 func (p *Paint) FillColorAt(x, y float64) RGBA {
+	x, y = p.gradientPoint(p.fill.brush, x, y)
 	return p.fill.colorAt(x, y)
 }
 
 // StrokeColorAt returns the stroke color at the given position.
+// The position is in device space; gradient brushes are sampled in user
+// space via the transform recorded by setGradientTransform.
 func (p *Paint) StrokeColorAt(x, y float64) RGBA {
+	x, y = p.gradientPoint(p.stroke.brush, x, y)
 	return p.stroke.colorAt(x, y)
 }
 
@@ -367,9 +431,9 @@ func (p *Paint) IsStrokeSolid() bool {
 // mode parameter through every blend function.
 func (p *Paint) colorAtForMode(strokeMode bool) func(x, y float64) RGBA {
 	if strokeMode {
-		return p.stroke.colorAt
+		return p.StrokeColorAt
 	}
-	return p.fill.colorAt
+	return p.FillColorAt
 }
 
 // GetStroke returns the effective stroke style.

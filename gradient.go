@@ -26,14 +26,24 @@ type ColorStop struct {
 }
 
 // sortStops sorts color stops by offset and removes duplicates.
+// Stops with non-finite offsets (NaN, ±Inf) are dropped: they cannot be
+// positioned on the gradient ramp and would make sort ordering and binary
+// search meaningless. Finite offsets outside [0, 1] are kept — they
+// participate in interpolation normally and are reached only via
+// ExtendRepeat/ExtendReflect, matching CSS gradient semantics.
 func sortStops(stops []ColorStop) []ColorStop {
 	if len(stops) == 0 {
 		return stops
 	}
 
-	// Create a copy to avoid modifying the original
-	sorted := make([]ColorStop, len(stops))
-	copy(sorted, stops)
+	// Create a copy to avoid modifying the original, dropping non-finite offsets.
+	sorted := make([]ColorStop, 0, len(stops))
+	for _, s := range stops {
+		if math.IsNaN(s.Offset) || math.IsInf(s.Offset, 0) {
+			continue
+		}
+		sorted = append(sorted, s)
+	}
 
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].Offset < sorted[j].Offset
@@ -43,6 +53,8 @@ func sortStops(stops []ColorStop) []ColorStop {
 }
 
 // applyExtendMode applies the extend mode to normalize t to [0, 1].
+// Unknown ExtendMode values degrade to ExtendPad (clamp), so an out-of-range
+// mode never produces undefined output.
 func applyExtendMode(t float64, mode ExtendMode) float64 {
 	switch mode {
 	case ExtendRepeat:
@@ -57,7 +69,7 @@ func applyExtendMode(t float64, mode ExtendMode) float64 {
 		if int(period)%2 == 1 {
 			t = 1 - t
 		}
-	default: // ExtendPad
+	default: // ExtendPad and unknown modes
 		t = clamp01(t)
 	}
 	return t
@@ -132,6 +144,14 @@ func colorAtOffset(stops []ColorStop, t float64, mode ExtendMode) RGBA {
 
 	// Apply extend mode to normalize t
 	t = applyExtendMode(t, mode)
+
+	// Non-finite t (from non-finite sample coordinates or Inf through
+	// Repeat/Reflect) degrades deterministically to the gradient start.
+	// Without this, NaN comparisons in the binary search below would make
+	// the result depend on stop count and ordering.
+	if math.IsNaN(t) || math.IsInf(t, 0) {
+		t = 0
+	}
 
 	// Find the two stops to interpolate between
 	// Binary search for efficiency (no allocation)

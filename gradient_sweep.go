@@ -76,11 +76,15 @@ func (SweepGradientBrush) brushMarker() {}
 
 // ColorAt returns the color at the given point.
 // Implements the Pattern and Brush interfaces.
+//
+// Degenerate geometry (non-finite center or angles) degrades to the first
+// stop's color. Empty stops return Transparent.
 func (g *SweepGradientBrush) ColorAt(x, y float64) RGBA {
-	// Handle point at center (undefined angle)
+	// Handle point at center (undefined angle) and non-finite geometry.
 	dx := x - g.Center.X
 	dy := y - g.Center.Y
-	if dx == 0 && dy == 0 {
+	if (dx == 0 && dy == 0) || !isFinite(dx) || !isFinite(dy) ||
+		!isFinite(g.StartAngle) || !isFinite(g.EndAngle) {
 		return firstStopColor(g.ensureSorted())
 	}
 

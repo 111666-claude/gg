@@ -81,15 +81,31 @@ func (RadialGradientBrush) brushMarker() {}
 
 // ColorAt returns the color at the given point.
 // Implements the Pattern and Brush interfaces.
+//
+// Degenerate geometry degrades to the first stop's color (a stable solid):
+// zero or reversed radius range (EndRadius <= StartRadius), negative radii,
+// and non-finite center/radius values. Empty stops return Transparent.
 func (g *RadialGradientBrush) ColorAt(x, y float64) RGBA {
-	// Handle degenerate gradient (zero radius difference)
-	radiusDiff := g.EndRadius - g.StartRadius
-	if radiusDiff == 0 {
+	if g.isDegenerate() {
 		return firstStopColor(g.ensureSorted())
 	}
 
 	t := g.computeT(x, y)
 	return colorAtOffset(g.ensureSorted(), t, g.Extend)
+}
+
+// isDegenerate reports whether the gradient geometry cannot produce a ramp.
+// A radial gradient needs finite, non-negative radii with EndRadius >
+// StartRadius and a finite center; anything else renders as a solid color.
+func (g *RadialGradientBrush) isDegenerate() bool {
+	if !isFinite(g.Center.X) || !isFinite(g.Center.Y) ||
+		!isFinite(g.StartRadius) || !isFinite(g.EndRadius) {
+		return true
+	}
+	if g.StartRadius < 0 || g.EndRadius < 0 {
+		return true
+	}
+	return g.EndRadius <= g.StartRadius
 }
 
 // ensureSorted returns stops sorted by offset, using a cached copy.

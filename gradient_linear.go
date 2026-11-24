@@ -57,13 +57,16 @@ func (LinearGradientBrush) brushMarker() {}
 
 // ColorAt returns the color at the given point.
 // Implements the Pattern and Brush interfaces.
+//
+// Degenerate geometry (zero-length gradient or non-finite endpoints)
+// degrades to the first stop's color. Empty stops return Transparent.
 func (g *LinearGradientBrush) ColorAt(x, y float64) RGBA {
-	// Handle zero-length gradient (start == end)
+	// Handle zero-length gradient (start == end) and non-finite endpoints.
 	dx := g.End.X - g.Start.X
 	dy := g.End.Y - g.Start.Y
 	lengthSq := dx*dx + dy*dy
 
-	if lengthSq == 0 {
+	if lengthSq == 0 || !isFinite(lengthSq) {
 		return firstStopColor(g.ensureSorted())
 	}
 

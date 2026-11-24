@@ -289,13 +289,6 @@ func TestBackendInterfaceCompliance(t *testing.T) {
 }
 
 func TestBackendLinearGradient(t *testing.T) {
-	// NOTE: Linear gradient rendering is limited by gg.SoftwareRenderer
-	// which currently only supports solid colors in fillSupersampled.
-	// The gradient brush is correctly created and set, but the renderer
-	// falls back to black. This test verifies the backend doesn't crash.
-	// Full gradient support requires gg library enhancement.
-	t.Skip("gradient rendering not yet supported by gg.SoftwareRenderer")
-
 	backend := NewBackend()
 	err := backend.Begin(100, 100)
 	if err != nil {
@@ -336,13 +329,6 @@ func TestBackendLinearGradient(t *testing.T) {
 }
 
 func TestBackendRadialGradient(t *testing.T) {
-	// NOTE: Radial gradient rendering is limited by gg.SoftwareRenderer
-	// which currently only supports solid colors in fillSupersampled.
-	// The gradient brush is correctly created and set, but the renderer
-	// falls back to black. This test verifies the backend doesn't crash.
-	// Full gradient support requires gg library enhancement.
-	t.Skip("gradient rendering not yet supported by gg.SoftwareRenderer")
-
 	backend := NewBackend()
 	err := backend.Begin(100, 100)
 	if err != nil {
