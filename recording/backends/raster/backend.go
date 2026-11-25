@@ -203,47 +203,8 @@ func (b *Backend) FillRect(rect recording.Rect, brush recording.Brush) {
 	_ = b.ctx.Fill()
 }
 
-// DrawImage draws an image from source to destination rectangle.
-func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, _ recording.ImageOptions) {
-	if img == nil {
-		return
-	}
-
-	// Save current state
-	b.ctx.Push()
-	defer b.ctx.Pop()
-
-	// Calculate scale
-	srcW := src.Width()
-	srcH := src.Height()
-	dstW := dst.Width()
-	dstH := dst.Height()
-
-	if srcW == 0 || srcH == 0 {
-		// Use full image bounds
-		bounds := img.Bounds()
-		srcW = float64(bounds.Dx())
-		srcH = float64(bounds.Dy())
-	}
-
-	scaleX := dstW / srcW
-	scaleY := dstH / srcH
-
-	// Apply transform for scaling and positioning
-	b.ctx.Translate(dst.MinX, dst.MinY)
-	b.ctx.Scale(scaleX, scaleY)
-	b.ctx.Translate(-src.MinX, -src.MinY)
-
-	// Draw the image at origin (transform handles positioning)
-	// Note: gg.Context.DrawImage takes int coordinates
-	// We need to handle the source rect cropping if specified
-	// For now, draw the full image and let the transform handle it
-	bounds := img.Bounds()
-	b.ctx.DrawRectangle(float64(bounds.Min.X), float64(bounds.Min.Y),
-		float64(bounds.Dx()), float64(bounds.Dy()))
-	// TODO: Implement proper image drawing with cropping
-	// For now, use a simple approach
-}
+// DrawImage is implemented in image.go with full source-rectangle cropping,
+// transform and edge-case handling.
 
 // DrawText draws text at the given position with the specified font face and brush.
 // The face carries the font set at recording time; Go GC keeps it alive while the

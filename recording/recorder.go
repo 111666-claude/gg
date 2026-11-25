@@ -1,6 +1,7 @@
 package recording
 
 import (
+	"fmt"
 	"image"
 	"math"
 	"strings"
@@ -135,9 +136,13 @@ func (r *Recording) Resources() *ResourcePool {
 }
 
 // Playback replays the recording to the given backend.
+//
+// Resource references are validated in command order before Begin is called, so
+// a missing image aborts with a *PlaybackError carrying the command index and
+// leaves the backend target untouched. Begin/End failures are wrapped with
+// Index == -1.
 func (r *Recording) Playback(backend Backend) error {
-	// Initialize backend
-	if err := backend.Begin(r.width, r.height); err != nil {
+	if err := r.startPlayback(backend); err != nil {
 		return err
 	}
 
@@ -145,7 +150,7 @@ func (r *Recording) Playback(backend Backend) error {
 	transformStack := make([]Matrix, 0, 8)
 
 	// Replay each command
-	for _, cmd := range r.commands {
+	for i, cmd := range r.commands {
 		switch c := cmd.(type) {
 		case SaveCommand:
 			transformStack = append(transformStack, transform)
@@ -189,8 +194,9 @@ func (r *Recording) Playback(backend Backend) error {
 			backend.StrokePath(path, brush, c.Stroke)
 			backend.Restore()
 		case DrawImageCommand:
-			img := r.resources.GetImage(c.Image)
-			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
+			if err := r.playbackDrawImage(backend, c, transform); err != nil {
+				return commandError(i, c, err)
+			}
 		case DrawTextCommand:
 			brush := r.resources.GetBrush(c.Brush)
 			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)
@@ -207,7 +213,126 @@ func (r *Recording) Playback(backend Backend) error {
 		}
 	}
 
-	return backend.End()
+	if err := backend.End(); err != nil {
+		return lifecycleError(fmt.Errorf("recording: backend End: %w", err))
+	}
+	return nil
+}
+
+// startPlayback validates resources and initializes the backend before any
+// command is replayed, so a missing resource leaves the target untouched.
+func (r *Recording) startPlayback(backend Backend) error {
+	if backend == nil {
+		return lifecycleError(ErrNilBackend)
+	}
+	// Resolve every pooled image in stream order. Reporting before Begin means
+	// a bad reference cannot leave a half-painted target behind.
+	if err := r.preflightResources(); err != nil {
+		return err
+	}
+	if err := backend.Begin(r.width, r.height); err != nil {
+		return lifecycleError(fmt.Errorf("recording: backend Begin: %w", err))
+	}
+	return nil
+}
+
+// playbackDrawImage resolves a draw-image command's resource and dispatches it.
+// Commands recorded by this package carry their own world affine; externally
+// built rectangle-only commands are re-anchored to the stream transform so a
+// previous fill that reset the backend CTM cannot cause a double transform.
+func (r *Recording) playbackDrawImage(backend Backend, c DrawImageCommand, transform Matrix) error {
+	var img image.Image
+	if r.resources != nil {
+		img = r.resources.GetImage(c.Image)
+	}
+	if img == nil || isNilImageLike(img) {
+		return fmt.Errorf("%w: image ref %d", ErrMissingResource, c.Image)
+	}
+	if !c.Options.HasTransform {
+		backend.SetTransform(transform)
+	}
+	backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
+	return nil
+}
+
+// preflightResources validates pooled resource references that must resolve
+// before any backend work starts. Commands are checked in stream order so the
+// first failure carries the earliest command index.
+func (r *Recording) preflightResources() error {
+	if r == nil {
+		return lifecycleError(ErrNilBackend)
+	}
+	for i, cmd := range r.commands {
+		if err := r.checkCommandResources(cmd); err != nil {
+			return commandError(i, cmd, err)
+		}
+	}
+	return nil
+}
+
+// checkCommandResources reports the first unresolvable image resource used by a
+// command: either a DrawImageCommand's image ref or a PatternBrush linked
+// through one of the command's brush refs. Standalone Set*Style commands are not
+// checked so that the index points at the actual draw command.
+func (r *Recording) checkCommandResources(cmd Command) error {
+	switch c := cmd.(type) {
+	case DrawImageCommand:
+		return r.checkImageResource(c.Image)
+	case FillPathCommand:
+		return r.checkBrushResource(c.Brush)
+	case StrokePathCommand:
+		return r.checkBrushResource(c.Brush)
+	case FillRectCommand:
+		return r.checkBrushResource(c.Brush)
+	case StrokeRectCommand:
+		return r.checkBrushResource(c.Brush)
+	case DrawTextCommand:
+		return r.checkBrushResource(c.Brush)
+	case StrokeTextCommand:
+		return r.checkBrushResource(c.Brush)
+	}
+	return nil
+}
+
+// checkBrushResource resolves a brush ref and, for pattern brushes, validates
+// the linked image ref.
+func (r *Recording) checkBrushResource(ref BrushRef) error {
+	if r.resources == nil {
+		return nil
+	}
+	pb, ok := patternBrushFrom(r.resources.GetBrush(ref))
+	if !ok {
+		return nil
+	}
+	return r.checkImageResource(pb.Image)
+}
+
+// checkImageResource verifies an image ref resolves to a non-nil image.
+func (r *Recording) checkImageResource(ref ImageRef) error {
+	var img image.Image
+	if r.resources != nil {
+		img = r.resources.GetImage(ref)
+	}
+	if img == nil || isNilImageLike(img) {
+		return fmt.Errorf("%w: image ref %d", ErrMissingResource, ref)
+	}
+	return nil
+}
+
+// patternBrushFrom returns the PatternBrush carried by a Brush value, accepting
+// both the value and pointer forms.
+func patternBrushFrom(b Brush) (*PatternBrush, bool) {
+	switch p := b.(type) {
+	case *PatternBrush:
+		if p == nil {
+			return nil, false
+		}
+		return p, true
+	case PatternBrush:
+		return &p, true
+	default:
+		return nil, false
+	}
 }
 
 // setPlaybackClip applies a world-space clip without disturbing the backend's
@@ -1031,87 +1156,61 @@ func (r *Recorder) ClipRoundRect(x, y, w, h, radius float64) {
 
 // DrawImage draws an image at the specified position.
 func (r *Recorder) DrawImage(img image.Image, x, y int) {
-	if img == nil {
+	if isNilImageLike(img) {
 		return
 	}
 
 	bounds := img.Bounds()
-	w := bounds.Dx()
-	h := bounds.Dy()
 
-	imageRef := r.resources.AddImage(img)
+	// Map absolute image pixels to user space at (x, y), rebasing the
+	// image's potentially non-zero Bounds.Min to the draw origin.
+	u := Translate(float64(x)-float64(bounds.Min.X),
+		float64(y)-float64(bounds.Min.Y))
 
-	// Transform destination rectangle
-	x1, y1 := r.transform.TransformPoint(float64(x), float64(y))
-	x2, y2 := r.transform.TransformPoint(float64(x+w), float64(y+h))
-
-	srcRect := NewRect(0, 0, float64(w), float64(h))
-	dstRect := NewRectFromPoints(x1, y1, x2, y2)
-
-	r.commands = append(r.commands, DrawImageCommand{
-		Image:   imageRef,
-		SrcRect: srcRect,
-		DstRect: dstRect,
-		Options: DefaultImageOptions(),
-	})
+	r.recordImageCommand(img, boundsRect(bounds), u)
 }
 
 // DrawImageAnchored draws an image with an anchor point.
 func (r *Recorder) DrawImageAnchored(img image.Image, x, y int, ax, ay float64) {
-	if img == nil {
+	if isNilImageLike(img) {
 		return
 	}
 
 	bounds := img.Bounds()
-	w := bounds.Dx()
-	h := bounds.Dy()
+	w := float64(bounds.Dx())
+	h := float64(bounds.Dy())
 
-	// Adjust position based on anchor
-	drawX := float64(x) - float64(w)*ax
-	drawY := float64(y) - float64(h)*ay
+	drawX := float64(x) - w*ax
+	drawY := float64(y) - h*ay
+	u := Translate(drawX-float64(bounds.Min.X),
+		drawY-float64(bounds.Min.Y))
 
-	imageRef := r.resources.AddImage(img)
-
-	// Transform destination rectangle
-	x1, y1 := r.transform.TransformPoint(drawX, drawY)
-	x2, y2 := r.transform.TransformPoint(drawX+float64(w), drawY+float64(h))
-
-	srcRect := NewRect(0, 0, float64(w), float64(h))
-	dstRect := NewRectFromPoints(x1, y1, x2, y2)
-
-	r.commands = append(r.commands, DrawImageCommand{
-		Image:   imageRef,
-		SrcRect: srcRect,
-		DstRect: dstRect,
-		Options: DefaultImageOptions(),
-	})
+	r.recordImageCommand(img, boundsRect(bounds), u)
 }
 
 // DrawImageScaled draws an image scaled to fit the specified rectangle.
+// Negative w or h mirror the image along that axis.
 func (r *Recorder) DrawImageScaled(img image.Image, x, y, w, h float64) {
-	if img == nil {
+	if isNilImageLike(img) {
 		return
 	}
 
 	bounds := img.Bounds()
-	srcW := bounds.Dx()
-	srcH := bounds.Dy()
+	srcW := float64(bounds.Dx())
+	srcH := float64(bounds.Dy())
+	if srcW == 0 || srcH == 0 {
+		return
+	}
 
-	imageRef := r.resources.AddImage(img)
+	// Absolute source pixels map onto the signed user rectangle (x,y,w,h).
+	u := Matrix{
+		A: w / srcW,
+		E: h / srcH,
+		C: x - float64(bounds.Min.X)*(w/srcW),
+		F: y - float64(bounds.Min.Y)*(h/srcH),
+	}
 
-	// Transform destination rectangle
-	x1, y1 := r.transform.TransformPoint(x, y)
-	x2, y2 := r.transform.TransformPoint(x+w, y+h)
-
-	srcRect := NewRect(0, 0, float64(srcW), float64(srcH))
-	dstRect := NewRectFromPoints(x1, y1, x2, y2)
-
-	r.commands = append(r.commands, DrawImageCommand{
-		Image:   imageRef,
-		SrcRect: srcRect,
-		DstRect: dstRect,
-		Options: DefaultImageOptions(),
-	})
+	r.recordImageCommand(img, boundsRect(bounds), u)
 }
 
 // --------------------------------------------------------------------------

@@ -261,12 +261,17 @@ func (StrokeRectCommand) Type() CommandType { return CmdStrokeRect }
 type DrawImageCommand struct {
 	// Image references the image in the resource pool.
 	Image ImageRef
-	// SrcRect is the source rectangle in image coordinates.
-	// If zero, uses the entire image.
+	// SrcRect is the source rectangle in the image's own coordinate space
+	// (the same space as image.Image.Bounds, so its Min may be non-zero).
+	// The zero Rect{} means the entire image Bounds. An explicitly empty or
+	// reversed rectangle addresses no pixels and draws nothing.
 	SrcRect Rect
-	// DstRect is the destination rectangle in canvas coordinates.
+	// DstRect is the destination rectangle in canvas/world coordinates.
+	// It is the axis-aligned bounding box of the mapped destination quad;
+	// Options.Transform carries the full affine mapping when rotation or
+	// mirroring makes that quad non-axis-aligned.
 	DstRect Rect
-	// Options contains rendering options (interpolation, etc.).
+	// Options contains rendering options (interpolation, alpha, transform).
 	Options ImageOptions
 }
 
@@ -487,6 +492,18 @@ type ImageOptions struct {
 	Interpolation InterpolationMode
 	// Alpha is the opacity (0.0 to 1.0).
 	Alpha float64
+
+	// Transform is an optional affine mapping from absolute image-pixel
+	// coordinates (the image's own Bounds space) to world/canvas coordinates.
+	// It preserves rotation, non-uniform scale and mirroring that the
+	// axis-aligned DstRect cannot represent. It is only consulted when
+	// HasTransform is true; otherwise backends derive the mapping from
+	// SrcRect and DstRect and the current backend transform.
+	Transform Matrix
+
+	// HasTransform reports whether Transform should be used. The zero value
+	// keeps the historical rect-only behavior.
+	HasTransform bool
 }
 
 // DefaultImageOptions returns ImageOptions with default settings.
