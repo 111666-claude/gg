@@ -218,25 +218,104 @@ func (c *Context) GetBlendMode() BlendMode {
 
 // compositeLayer composites a layer onto a parent pixmap using the layer's
 // blend mode and opacity.
+//
+// Compositing runs in premultiplied alpha space (the storage format of both
+// pixmaps). All BlendMode values are supported through the shared blend table,
+// not only the four legacy modes understood by internal/image.DrawImage.
 func (c *Context) compositeLayer(layer *Layer, parent *Pixmap) {
-	// Convert pixmaps to ImageBuf for blending
-	srcImg := c.pixmapToImageBuf(layer.pixmap)
-	dstImg := c.pixmapToImageBuf(parent)
+	if layer == nil || layer.pixmap == nil || parent == nil {
+		return
+	}
+	compositePixmapLayer(parent, layer.pixmap,
+		mapPublicBlendMode(layer.blendMode), layer.opacity)
+}
 
-	// Use DrawImage to composite with blend mode and opacity
-	srcW, srcH := srcImg.Bounds()
-
-	params := intImage.DrawParams{
-		DstRect: intImage.Rect{
-			X:      0,
-			Y:      0,
-			Width:  srcW,
-			Height: srcH,
-		},
-		Interp:    intImage.InterpNearest, // No scaling, so nearest is fine
-		Opacity:   layer.opacity,
-		BlendMode: layer.blendMode,
+// compositePixmapLayer blends src onto dst in place using an internal paint
+// blend mode. opacity in [0,1] scales the (already premultiplied) source
+// channels. Only the overlap of the two pixmaps is touched, so differently
+// sized layers can never write out of bounds.
+func compositePixmapLayer(dst, src *Pixmap, mode paintBlendMode, opacity float64) {
+	if dst == nil || src == nil {
+		return
+	}
+	switch {
+	case opacity != opacity: // NaN: corrupt value must not erase content.
+		opacity = 1
+	case opacity < 0:
+		opacity = 0
+	case opacity > 1:
+		opacity = 1
+	}
+	if opacity == 0 {
+		return
 	}
 
-	intImage.DrawImage(dstImg, srcImg, params)
+	fn := getBlendFunc(mode)
+	alphaScale := floatToByte(opacity)
+
+	w := dst.Width()
+	if sw := src.Width(); sw < w {
+		w = sw
+	}
+	h := dst.Height()
+	if sh := src.Height(); sh < h {
+		h = sh
+	}
+	if w <= 0 || h <= 0 {
+		return
+	}
+
+	dstData := dst.Data()
+	srcData := src.Data()
+	dstStride := dst.Width() * 4
+	srcStride := src.Width() * 4
+
+	// Source-over at full opacity is the common fast path.
+	if mode == blendModeSourceOver && opacity == 1 {
+		for y := 0; y < h; y++ {
+			dstRow := y * dstStride
+			srcRow := y * srcStride
+			for x := 0; x < w; x++ {
+				di := dstRow + x*4
+				si := srcRow + x*4
+				sa := srcData[si+3]
+				if sa == 0 {
+					continue
+				}
+				if sa == 255 {
+					dstData[di] = srcData[si]
+					dstData[di+1] = srcData[si+1]
+					dstData[di+2] = srcData[si+2]
+					dstData[di+3] = 255
+					continue
+				}
+				inv := 255 - sa
+				dstData[di] = addDiv255PD(srcData[si], mulDiv255PD(dstData[di], inv))
+				dstData[di+1] = addDiv255PD(srcData[si+1], mulDiv255PD(dstData[di+1], inv))
+				dstData[di+2] = addDiv255PD(srcData[si+2], mulDiv255PD(dstData[di+2], inv))
+				dstData[di+3] = addDiv255PD(sa, mulDiv255PD(dstData[di+3], inv))
+			}
+		}
+		return
+	}
+
+	for y := 0; y < h; y++ {
+		dstRow := y * dstStride
+		srcRow := y * srcStride
+		for x := 0; x < w; x++ {
+			di := dstRow + x*4
+			si := srcRow + x*4
+			sr := mulDiv255PD(srcData[si], alphaScale)
+			sg := mulDiv255PD(srcData[si+1], alphaScale)
+			sb := mulDiv255PD(srcData[si+2], alphaScale)
+			sa := mulDiv255PD(srcData[si+3], alphaScale)
+
+			or, og, ob, oa := fn(sr, sg, sb, sa,
+				dstData[di], dstData[di+1], dstData[di+2], dstData[di+3])
+			dstData[di] = or
+			dstData[di+1] = og
+			dstData[di+2] = ob
+			dstData[di+3] = oa
+		}
+	}
 }

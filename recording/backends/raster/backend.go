@@ -46,6 +46,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"math"
 
 	"github.com/gogpu/gg"
 	"github.com/gogpu/gg/recording"
@@ -203,46 +204,99 @@ func (b *Backend) FillRect(rect recording.Rect, brush recording.Brush) {
 	_ = b.ctx.Fill()
 }
 
-// DrawImage draws an image from source to destination rectangle.
-func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, _ recording.ImageOptions) {
-	if img == nil {
+// SetBlendMode forwards a recorded blend mode to the gg context. It makes
+// *Backend implement recording.BlendModeBackend. Save/Restore already push/pop
+// the gg paint state, so the mode is restored with the graphics state.
+func (b *Backend) SetBlendMode(mode recording.BlendMode) {
+	if b.ctx != nil {
+		b.ctx.SetBlendMode(mode)
+	}
+}
+
+// DrawImage draws an image from source to destination rectangle, honoring
+// source cropping, non-zero image Bounds, opacity and interpolation.
+//
+// Rects are in world space; the device scale is applied through the CTM like
+// FillRect. Images with a non-zero Bounds.Min are re-indexed to (0,0) by
+// gg.ImageBufFromImage, so an explicit source rect is shifted by Bounds.Min
+// before being passed to DrawImageEx.
+func (b *Backend) DrawImage(img image.Image, src, dst recording.Rect, opts recording.ImageOptions) {
+	if img == nil || b.ctx == nil {
+		return
+	}
+	if dst.Width() <= 0 || dst.Height() <= 0 {
+		return
+	}
+	if !rasterFiniteRect(dst) {
 		return
 	}
 
-	// Save current state
-	b.ctx.Push()
-	defer b.ctx.Pop()
+	buf := gg.ImageBufFromImage(img)
+	if buf == nil {
+		return
+	}
+	bufW, bufH := buf.Bounds()
 
-	// Calculate scale
-	srcW := src.Width()
-	srcH := src.Height()
-	dstW := dst.Width()
-	dstH := dst.Height()
-
-	if srcW == 0 || srcH == 0 {
-		// Use full image bounds
-		bounds := img.Bounds()
-		srcW = float64(bounds.Dx())
-		srcH = float64(bounds.Dy())
+	var srcRect image.Rectangle
+	if src.Width() > 0 && src.Height() > 0 {
+		srcRect = image.Rect(
+			int(math.Floor(src.MinX)), int(math.Floor(src.MinY)),
+			int(math.Ceil(src.MaxX)), int(math.Ceil(src.MaxY)),
+		)
+		// Recording source coords live in the image's own coordinate space.
+		// ImageBufFromImage re-indexes to a zero-origin buffer, so remove the
+		// image origin before sampling.
+		if bounds := img.Bounds(); !bounds.Min.Eq(image.Point{}) {
+			srcRect = srcRect.Sub(bounds.Min)
+		}
+		srcRect = srcRect.Intersect(image.Rect(0, 0, bufW, bufH))
+		if srcRect.Empty() {
+			return
+		}
 	}
 
-	scaleX := dstW / srcW
-	scaleY := dstH / srcH
+	opacity := opts.Alpha
+	if opacity <= 0 {
+		// ImageOptions zero value means "unset"; the documented default is 1.
+		opacity = 1
+	}
+	if opacity > 1 {
+		opacity = 1
+	}
+	if math.IsNaN(opacity) || math.IsInf(opacity, 0) {
+		opacity = 1
+	}
 
-	// Apply transform for scaling and positioning
-	b.ctx.Translate(dst.MinX, dst.MinY)
-	b.ctx.Scale(scaleX, scaleY)
-	b.ctx.Translate(-src.MinX, -src.MinY)
+	interpolation := gg.InterpBilinear
+	if opts.Interpolation == recording.InterpolationNearest {
+		interpolation = gg.InterpNearest
+	}
 
-	// Draw the image at origin (transform handles positioning)
-	// Note: gg.Context.DrawImage takes int coordinates
-	// We need to handle the source rect cropping if specified
-	// For now, draw the full image and let the transform handle it
-	bounds := img.Bounds()
-	b.ctx.DrawRectangle(float64(bounds.Min.X), float64(bounds.Min.Y),
-		float64(bounds.Dx()), float64(bounds.Dy()))
-	// TODO: Implement proper image drawing with cropping
-	// For now, use a simple approach
+	b.applyDeviceScale()
+	drawOpts := gg.DrawImageOptions{
+		X:             dst.MinX,
+		Y:             dst.MinY,
+		DstWidth:      dst.Width(),
+		DstHeight:     dst.Height(),
+		Interpolation: interpolation,
+		Opacity:       opacity,
+		BlendMode:     gg.BlendNormal,
+	}
+	if !srcRect.Empty() {
+		drawOpts.SrcRect = &srcRect
+	}
+	b.ctx.DrawImageEx(buf, drawOpts)
+}
+
+// rasterFiniteRect reports whether all rect coordinates are finite.
+func rasterFiniteRect(r recording.Rect) bool {
+	return rasterFinite(r.MinX) && rasterFinite(r.MinY) &&
+		rasterFinite(r.MaxX) && rasterFinite(r.MaxY)
+}
+
+// rasterFinite reports whether v is neither NaN nor infinite.
+func rasterFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 // DrawText draws text at the given position with the specified font face and brush.

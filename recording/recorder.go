@@ -191,6 +191,12 @@ func (r *Recording) Playback(backend Backend) error {
 		case DrawImageCommand:
 			img := r.resources.GetImage(c.Image)
 			backend.DrawImage(img, c.SrcRect, c.DstRect, c.Options)
+		case SetBlendModeCommand:
+			// Optional backend capability: backends without blend support
+			// keep their default compositing instead of failing replay.
+			if bb, ok := backend.(BlendModeBackend); ok {
+				bb.SetBlendMode(c.Mode)
+			}
 		case DrawTextCommand:
 			brush := r.resources.GetBrush(c.Brush)
 			backend.DrawText(c.Text, c.X, c.Y, c.Face, brush)

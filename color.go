@@ -164,10 +164,13 @@ func (c RGBA) Lerp(other RGBA, t float64) RGBA {
 
 // clamp65535 restricts a value to [0, 65535] range.
 func clamp65535(x float64) float64 {
+	if x != x { // NaN has no deterministic order; map to transparent/zero.
+		return 0
+	}
 	if x < 0 {
 		return 0
 	}
-	if x > 65535 {
+	if x > 65535 { // +Inf also clamps here.
 		return 65535
 	}
 	return x
@@ -175,6 +178,9 @@ func clamp65535(x float64) float64 {
 
 // clamp255 restricts a value to [0, 255] range.
 func clamp255(x float64) float64 {
+	if x != x { // NaN -> 0 for deterministic output.
+		return 0
+	}
 	if x < 0 {
 		return 0
 	}

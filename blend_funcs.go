@@ -165,12 +165,17 @@ func blendScreenFn(sr, sg, sb, sa, dr, dg, db, da byte) (byte, byte, byte, byte)
 }
 
 func blendOverlayFn(sr, sg, sb, sa, dr, dg, db, da byte) (byte, byte, byte, byte) {
-	return separableBlendPD(sr, sg, sb, sa, dr, dg, db, da, func(s, d byte) byte {
-		if d <= 128 {
-			return mulDiv255PD(2*d, s)
-		}
-		return 255 - mulDiv255PD(2*(255-d), 255-s)
-	})
+	return separableBlendPD(sr, sg, sb, sa, dr, dg, db, da, overlayChannelPD)
+}
+
+// overlayChannelPD is the W3C overlay channel. The backdrop channel selects
+// multiply (d <= 0.5, byte d <= 127) vs screen. uint16 arithmetic prevents the
+// 2*d byte wrap at d==128 that a byte expression would hit.
+func overlayChannelPD(s, d byte) byte {
+	if d <= 127 {
+		return mulDiv255PD(byte(2*uint16(d)), s) //nolint:gosec // 2*d<=254
+	}
+	return 255 - mulDiv255PD(byte(2*uint16(255-d)), 255-s) //nolint:gosec // bounded
 }
 
 func blendDarkenFn(sr, sg, sb, sa, dr, dg, db, da byte) (byte, byte, byte, byte) {
@@ -219,10 +224,12 @@ func blendColorBurnFn(sr, sg, sb, sa, dr, dg, db, da byte) (byte, byte, byte, by
 
 func blendHardLightFn(sr, sg, sb, sa, dr, dg, db, da byte) (byte, byte, byte, byte) {
 	return separableBlendPD(sr, sg, sb, sa, dr, dg, db, da, func(s, d byte) byte {
-		if s <= 128 {
-			return mulDiv255PD(2*s, d)
+		// Hard-light is overlay with source and backdrop swapped, so the
+		// source channel s selects the branch.
+		if s <= 127 {
+			return mulDiv255PD(byte(2*uint16(s)), d) //nolint:gosec // 2*s<=254
 		}
-		return 255 - mulDiv255PD(2*(255-s), 255-d)
+		return 255 - mulDiv255PD(byte(2*uint16(255-s)), 255-d) //nolint:gosec // bounded
 	})
 }
 

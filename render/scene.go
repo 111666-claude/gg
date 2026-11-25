@@ -4,7 +4,9 @@
 package render
 
 import (
+	"image"
 	"image/color"
+	"math"
 
 	"github.com/gogpu/gg/internal/raster"
 )
@@ -62,9 +64,61 @@ type Scene struct {
 	// currentFillRule is the fill rule for fill operations.
 	currentFillRule raster.FillRule
 
+	// currentBlend is the blend mode for subsequent fill/stroke/image ops.
+	currentBlend BlendMode
+
+	// currentOpacity is an extra alpha multiplier in [0,1] for subsequent ops.
+	currentOpacity float64
+
+	// currentClip is the current axis-aligned clip rectangle in target
+	// coordinates. The zero value means "no clip"; clipActive distinguishes a
+	// set clip (which may be empty) from an unset one.
+	currentClip       clipRect
+	currentClipActive bool
+
+	// stateStack backs Save/Restore.
+	stateStack []sceneState
+
 	// Damage tracking for efficient partial redraws
 	dirtyRects []DirtyRect
 	fullRedraw bool
+}
+
+// clipRect is an axis-aligned clip rectangle in scene/target coordinates.
+type clipRect struct {
+	minX, minY, maxX, maxY float64
+}
+
+// empty reports whether the clip covers no area.
+func (c clipRect) empty() bool { return c.maxX <= c.minX || c.maxY <= c.minY }
+
+// intersect returns the intersection of two clip rectangles.
+func (c clipRect) intersect(o clipRect) clipRect {
+	if c.minX < o.minX {
+		c.minX = o.minX
+	}
+	if c.minY < o.minY {
+		c.minY = o.minY
+	}
+	if c.maxX > o.maxX {
+		c.maxX = o.maxX
+	}
+	if c.maxY > o.maxY {
+		c.maxY = o.maxY
+	}
+	return c
+}
+
+// sceneState is the restorable Scene graphics state.
+type sceneState struct {
+	fillColor   color.Color
+	strokeColor color.Color
+	strokeWidth float64
+	fillRule    raster.FillRule
+	blend       BlendMode
+	opacity     float64
+	clip        clipRect
+	clipActive  bool
 }
 
 // drawCommand represents a single drawing operation.
@@ -74,6 +128,17 @@ type drawCommand struct {
 	color    color.Color
 	width    float64
 	fillRule raster.FillRule
+
+	// blend and opacity are the snapshotted paint state for this command.
+	blend   BlendMode
+	opacity float64
+
+	// clip is the snapshotted axis-aligned clip for this command.
+	clip       clipRect
+	clipActive bool
+
+	// image is populated only for opImage commands.
+	image *ImageDrawOp
 }
 
 // drawOp is the type of drawing operation.
@@ -83,7 +148,32 @@ const (
 	opFill drawOp = iota
 	opStroke
 	opClear
+	opImage
 )
+
+// ImageDrawOp is a self-contained image draw command for SoftwareRenderer.
+//
+// Dst specifies the destination rectangle in target coordinates. Src specifies
+// the sampled rectangle in the image's own pixel coordinates; a zero-width or
+// zero-height Src selects the full image Bounds, which correctly handles images
+// whose Bounds do not start at (0,0).
+type ImageDrawOp struct {
+	// Image is the source raster. Must be non-nil at Render time.
+	Image image.Image
+
+	// Src is the source rectangle in image pixel coordinates. Empty selects
+	// the full image bounds.
+	Src image.Rectangle
+
+	// DstX/DstY/DstW/DstH describe the destination rectangle.
+	DstX, DstY, DstW, DstH float64
+
+	// Opacity is an extra alpha multiplier in [0,1].
+	Opacity float64
+
+	// Blend is the blend mode for the image.
+	Blend BlendMode
+}
 
 // pathBuilder accumulates path construction commands.
 type pathBuilder struct {
@@ -99,7 +189,137 @@ func NewScene() *Scene {
 		currentStrokeColor: color.Black,
 		currentStrokeWidth: 1.0,
 		currentFillRule:    raster.FillRuleNonZero,
+		currentOpacity:     1.0,
 	}
+}
+
+// Save pushes a copy of the current graphics state (colors, stroke, blend,
+// opacity, clip) onto a stack. It is paired with Restore.
+func (s *Scene) Save() {
+	s.stateStack = append(s.stateStack, sceneState{
+		fillColor:   s.currentFillColor,
+		strokeColor: s.currentStrokeColor,
+		strokeWidth: s.currentStrokeWidth,
+		fillRule:    s.currentFillRule,
+		blend:       s.currentBlend,
+		opacity:     s.currentOpacity,
+		clip:        s.currentClip,
+		clipActive:  s.currentClipActive,
+	})
+}
+
+// Restore pops the most recently saved graphics state. An empty stack makes
+// Restore a deterministic no-op (matching gg.Context.Pop and Cairo/Skia
+// tolerance for unbalanced restores).
+func (s *Scene) Restore() {
+	n := len(s.stateStack)
+	if n == 0 {
+		return
+	}
+	st := s.stateStack[n-1]
+	s.stateStack = s.stateStack[:n-1]
+	s.currentFillColor = st.fillColor
+	s.currentStrokeColor = st.strokeColor
+	s.currentStrokeWidth = st.strokeWidth
+	s.currentFillRule = st.fillRule
+	s.currentBlend = st.blend
+	s.currentOpacity = st.opacity
+	s.currentClip = st.clip
+	s.currentClipActive = st.clipActive
+}
+
+// SetBlendMode sets the blend mode used by subsequent fills, strokes and
+// image draws. The zero value / BlendNormal is source-over.
+func (s *Scene) SetBlendMode(mode BlendMode) {
+	s.currentBlend = mode
+}
+
+// BlendMode returns the current blend mode.
+func (s *Scene) BlendMode() BlendMode { return s.currentBlend }
+
+// SetOpacity sets an extra alpha multiplier in [0,1] for subsequent drawing.
+// Out-of-range and non-finite values are clamped deterministically.
+func (s *Scene) SetOpacity(opacity float64) {
+	s.currentOpacity = clampOpacity(opacity)
+}
+
+// Opacity returns the current opacity multiplier.
+func (s *Scene) Opacity() float64 { return s.currentOpacity }
+
+// ClipRect intersects the current clip with the given rectangle. Coordinates
+// are in target pixels because render.Scene has no user transform.
+func (s *Scene) ClipRect(x, y, width, height float64) {
+	r := clipRect{minX: x, minY: y, maxX: x + width, maxY: y + height}
+	if s.currentClipActive {
+		r = s.currentClip.intersect(r)
+	}
+	s.currentClip = r
+	s.currentClipActive = true
+}
+
+// SetClipEmpty installs a clip that rejects every pixel (an empty region).
+func (s *Scene) SetClipEmpty() {
+	s.currentClip = clipRect{0, 0, 0, 0}
+	s.currentClipActive = true
+}
+
+// ResetClip removes any clip installed on the scene.
+func (s *Scene) ResetClip() {
+	s.currentClip = clipRect{}
+	s.currentClipActive = false
+}
+
+// DrawImage records an image draw into the destination rectangle
+// (x,y)-(x+width,y+height). The image's own Bounds and source crop are handled
+// at render time, so images with a non-zero Bounds.Min land at (x,y), not at
+// their backing-store origin.
+func (s *Scene) DrawImage(img image.Image, x, y, width, height float64) {
+	if img == nil {
+		return
+	}
+	s.commands = append(s.commands, drawCommand{
+		op:         opImage,
+		blend:      s.currentBlend,
+		opacity:    s.currentOpacity,
+		clip:       s.currentClip,
+		clipActive: s.currentClipActive,
+		image: &ImageDrawOp{
+			Image: img,
+			DstX:  x, DstY: y, DstW: width, DstH: height,
+			Opacity: s.currentOpacity,
+			Blend:   s.currentBlend,
+		},
+	})
+}
+
+// DrawImageRect is an alias for DrawImage using an image.Rectangle destination.
+func (s *Scene) DrawImageRect(img image.Image, dst image.Rectangle) {
+	s.DrawImage(img, float64(dst.Min.X), float64(dst.Min.Y),
+		float64(dst.Dx()), float64(dst.Dy()))
+}
+
+// DrawImageOp records a fully specified image draw operation.
+func (s *Scene) DrawImageOp(op ImageDrawOp) {
+	if op.Image == nil {
+		return
+	}
+	if op.Opacity == 0 {
+		op.Opacity = s.currentOpacity
+	}
+	if !math.IsNaN(op.Opacity) {
+		op.Opacity = clampOpacity(op.Opacity)
+	}
+	if op.Blend == 0 {
+		op.Blend = s.currentBlend
+	}
+	s.commands = append(s.commands, drawCommand{
+		op:         opImage,
+		blend:      op.Blend,
+		opacity:    op.Opacity,
+		clip:       s.currentClip,
+		clipActive: s.currentClipActive,
+		image:      &op,
+	})
 }
 
 // Reset clears the scene for reuse.
@@ -110,6 +330,11 @@ func (s *Scene) Reset() {
 	s.currentStrokeColor = color.Black
 	s.currentStrokeWidth = 1.0
 	s.currentFillRule = raster.FillRuleNonZero
+	s.currentBlend = BlendModeSourceOver
+	s.currentOpacity = 1.0
+	s.currentClip = clipRect{}
+	s.currentClipActive = false
+	s.stateStack = nil
 	s.ClearDirty()
 }
 
@@ -260,10 +485,14 @@ func (s *Scene) Fill() {
 	path := s.snapshotPath()
 
 	s.commands = append(s.commands, drawCommand{
-		op:       opFill,
-		path:     path,
-		color:    s.currentFillColor,
-		fillRule: s.currentFillRule,
+		op:         opFill,
+		path:       path,
+		color:      s.currentFillColor,
+		fillRule:   s.currentFillRule,
+		blend:      s.currentBlend,
+		opacity:    s.currentOpacity,
+		clip:       s.currentClip,
+		clipActive: s.currentClipActive,
 	})
 
 	// Clear the current path
@@ -280,10 +509,14 @@ func (s *Scene) Stroke() {
 	path := s.snapshotPath()
 
 	s.commands = append(s.commands, drawCommand{
-		op:    opStroke,
-		path:  path,
-		color: s.currentStrokeColor,
-		width: s.currentStrokeWidth,
+		op:         opStroke,
+		path:       path,
+		color:      s.currentStrokeColor,
+		width:      s.currentStrokeWidth,
+		blend:      s.currentBlend,
+		opacity:    s.currentOpacity,
+		clip:       s.currentClip,
+		clipActive: s.currentClipActive,
 	})
 
 	// Clear the current path

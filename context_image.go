@@ -68,6 +68,10 @@ const (
 	// BlendNormal performs standard alpha blending (source over destination).
 	BlendNormal = intImage.BlendNormal
 
+	// BlendSourceOver is the W3C/Porter-Duff name for BlendNormal. Both map
+	// to source-over compositing (the default).
+	BlendSourceOver BlendMode = 0
+
 	// BlendMultiply multiplies source and destination colors.
 	// Result is always darker or equal. Formula: dst * src
 	BlendMultiply = intImage.BlendMultiply
@@ -168,6 +172,10 @@ const (
 
 	// BlendSource replaces destination with source (ignores destination).
 	BlendSource BlendMode = 30
+
+	// BlendCopy is the W3C/Porter-Duff "copy" operator, an alias for
+	// BlendSource: the source replaces the destination.
+	BlendCopy = BlendSource
 
 	// BlendDestination keeps destination unchanged (ignores source, no-op).
 	BlendDestination BlendMode = 31
@@ -335,6 +343,12 @@ func (c *Context) DrawImageEx(img *ImageBuf, opts DrawImageOptions) {
 
 	// Save current state (paint, path, transform).
 	c.Push()
+
+	// Honor the per-image blend mode inside the saved state so Pop restores
+	// the context's previous mode. DrawImageOptions.BlendMode uses the same
+	// public enum as SetBlendMode; a zero/Normal value maps to source-over.
+	// Without this, Multiply/Screen image draws silently used source-over.
+	c.SetBlendMode(opts.BlendMode)
 
 	// Set image pattern as fill source.
 	c.SetFillPattern(pattern)
